@@ -94,7 +94,7 @@ def generate_turbine_data_3d(num_samples=1000, grid_size=20, num_cooling_inlets=
         ])
         model_params_list.append(combined_params)
 
-        # 4. 生成3D物理场数据 (T/V/P) - 适配NS方程的稳态分布
+        # 4. 生成3D物理场数据 (T/V/P) 
         avg_T_cooling = np.mean(cooling_params[i, :, 0])
         avg_m_cooling = np.mean(cooling_params[i, :, 1])
         avg_I_cooling = np.mean(cooling_params[i, :, 2])
@@ -137,7 +137,7 @@ print(f"Spatial domain: x,y,z ∈ [0, 1] with {grid_size}×{grid_size}×{grid_si
 
 
 def plot_3d_field_3d(ax, X, Y, Z, field_3d, title, cmap='RdYlBu_r'):
-    """绘制完整3D曲面图（替代原来的2D切片）"""
+    """绘制完整3D曲面图"""
     # 展平网格和场数据
     X_flat = X.flatten()
     Y_flat = Y.flatten()
@@ -341,11 +341,10 @@ def compute_gradient(output, inputs):
 
 
 def compute_divergence(grad, spatial_coords, dim=3):
-    """计算梯度的散度（3D）"""
+    """计算梯度的散度"""
     # grad shape: [batch, N, dim]
     divergence = torch.zeros_like(grad[..., 0], device=grad.device)
     for d in range(dim):
-        # 修复：计算梯度的第d维 对 空间坐标的第d维 的偏导数
         d2 = compute_gradient(grad[..., d:d + 1], spatial_coords)[..., d]
         divergence += d2
 
@@ -421,12 +420,12 @@ def physics_informed_loss_3d(model, cooling_batch, params_batch, physics_true_ba
 
     physics_loss = torch.tensor(0.0, device=device)
     if is_training and spatial_coords.requires_grad:
-        # 训练阶段：正常计算物理损失
+        # 训练阶段
         u_pred = physics_pred_flat[:, :, 1:2]  # 速度场
         p_pred = physics_pred_flat[:, :, 2:3]  # 压力场
         physics_loss = compute_physics_loss(u_pred, p_pred, spatial_coords)
     elif not is_training:
-        # 验证阶段：临时启用梯度计算物理损失
+        # 验证阶段
         with torch.enable_grad():
             u_pred = physics_pred_flat[:, :, 1:2].detach().requires_grad_(True)
             p_pred = physics_pred_flat[:, :, 2:3].detach().requires_grad_(True)
