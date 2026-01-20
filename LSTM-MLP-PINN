@@ -1,0 +1,778 @@
+import numpy as np
+import warnings
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib import cm
+
+warnings.filterwarnings('ignore')
+
+# Set style and random seeds
+np.random.seed(42)
+torch.manual_seed(42)
+
+
+# Device selection
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
+device = get_device()
+print(f"Using device: {device}")
+
+
+def generate_turbine_data_3d(num_samples=1000, grid_size=20, num_cooling_inlets=9):
+    """Generate 3D turbine vane data with cooling parameters """
+    # 生成3D网格坐标
+    x = np.linspace(0, 1, grid_size)
+    y = np.linspace(0, 1, grid_size)
+    z = np.linspace(0, 1, grid_size)
+    X, Y, Z = np.meshgrid(x, y, z)
+    grid_shape = (grid_size, grid_size, grid_size)
+
+    # 初始化数据结构
+    cooling_params = np.zeros((num_samples, num_cooling_inlets, 3))
+    physics_fields = np.zeros((num_samples, grid_size, grid_size, grid_size, 3))  # [样本, x, y, z, T/V/P]
+    model_params_list = []
+
+    # NS方程常数
+    rho = 1.225  # 空气密度 kg/m³
+    nu = 1.5e-5  # 运动粘度 m²/s
+
+    for i in range(num_samples):
+        # 1. 生成冷却参数序列 (Tcn, ṁcn, Icn)(随机0-1)
+        for n in range(num_cooling_inlets):
+            T_cn = np.random.uniform(0.2, 0.8)
+            m_cn = np.random.uniform(0.1, 0.9)
+            I_cn = np.random.uniform(0.1, 0.5)
+            cooling_params[i, n] = [T_cn, m_cn, I_cn]
+
+        # 2. 结构参数 (5个) + 操作参数 (7个) = 12个标量参数
+        material_property = np.random.uniform(0.5, 1.5)
+        geometry_param = np.random.uniform(0.3, 1.2)
+        flow_field_char = np.random.uniform(0.4, 1.3)
+        blade_thickness = np.random.uniform(0.1, 0.3)
+        chord_length = np.random.uniform(0.8, 1.2)
+
+        inlet_pressure = np.random.uniform(0.8, 1.2)
+        inlet_velocity = np.random.uniform(0.6, 1.4)
+        boundary_condition = np.random.uniform(0.0, 1.0)
+        gas_density = np.random.uniform(0.7, 1.3)
+        gas_specific_heat = np.random.uniform(0.9, 1.1)
+        gas_mass_flow = np.random.uniform(0.5, 1.5)
+        reynolds_number = np.random.uniform(10000, 500000)
+        reynolds_norm = (reynolds_number - 10000) / 490000
+
+        scalar_params = np.array([
+            material_property, geometry_param, flow_field_char, blade_thickness, chord_length,
+            inlet_pressure, inlet_velocity, boundary_condition, gas_density,
+            gas_specific_heat, gas_mass_flow, reynolds_norm
+        ])
+
+        # 3. 组合标量参数和3D空间坐标
+        X_flat = X.flatten()
+        Y_flat = Y.flatten()
+        Z_flat = Z.flatten()
+        num_spatial_points = grid_size ** 3  # 3D网格总点数
+        scalar_params_expanded = np.tile(scalar_params, (num_spatial_points, 1))
+
+        # 拼接标量参数 + 3D坐标 (12 + 3 = 15维)
+        combined_params = np.hstack([
+            scalar_params_expanded,
+            X_flat.reshape(-1, 1),
+            Y_flat.reshape(-1, 1),
+            Z_flat.reshape(-1, 1)
+        ])
+        model_params_list.append(combined_params)
+
+        # 4. 生成3D物理场数据 (T/V/P) - 适配NS方程的稳态分布
+        avg_T_cooling = np.mean(cooling_params[i, :, 0])
+        avg_m_cooling = np.mean(cooling_params[i, :, 1])
+        avg_I_cooling = np.mean(cooling_params[i, :, 2])
+
+        # 3D速度场（需根据数据集修改）
+        V_field = inlet_velocity * (
+                0.8 + 0.4 * np.sin(2 * np.pi * X) * np.sin(np.pi * Y) * np.cos(2 * np.pi * Z)
+        ) + 0.1 * avg_m_cooling
+
+        # 3D压力场（需根据数据集修改）
+        P_field = inlet_pressure * (1 - 0.2 * avg_I_cooling) * (
+                1 - 0.15 * np.cos(np.pi * X) * np.cos(2 * np.pi * Y) * np.sin(np.pi * Z)
+        ) + 0.5 * rho * V_field ** 2  # 伯努利项
+
+        # 3D温度场（需根据数据集修改）
+        T_field = (1 - 0.5 * avg_T_cooling) * (
+                1 - 0.3 * np.sin(np.pi * X) * np.cos(np.pi * Y) * np.sin(np.pi * Z)
+        ) + 0.2 * material_property
+
+        physics_fields[i, :, :, :, 0] = T_field
+        physics_fields[i, :, :, :, 1] = V_field
+        physics_fields[i, :, :, :, 2] = P_field
+
+    model_params = np.array(model_params_list)
+    return cooling_params, model_params, physics_fields, X, Y, Z
+
+
+# 生成3D数据
+print("=== GENERATING 3D TURBINE VANE DATA ===")
+grid_size = 20  # 3D网格大小 (20x20x20)
+cooling_params, model_params, physics_fields, X, Y, Z = generate_turbine_data_3d(
+    num_samples=1000, grid_size=grid_size, num_cooling_inlets=9
+)
+
+print(f"Generated {len(cooling_params)} turbine samples")
+print(f"Cooling parameters shape: {cooling_params.shape}")
+print(f"Model parameters shape: {model_params.shape}")  # [样本数, 总点数, 15]
+print(f"Physics fields shape: {physics_fields.shape}")  # [样本数, x, y, z, 3]
+print(f"Spatial domain: x,y,z ∈ [0, 1] with {grid_size}×{grid_size}×{grid_size} grid points")
+
+
+def plot_3d_field_3d(ax, X, Y, Z, field_3d, title, cmap='RdYlBu_r'):
+    """绘制完整3D曲面图（替代原来的2D切片）"""
+    # 展平网格和场数据
+    X_flat = X.flatten()
+    Y_flat = Y.flatten()
+    Z_flat = Z.flatten()
+    field_flat = field_3d.flatten()
+
+    # 绘制3D曲面
+    surf = ax.scatter(X_flat, Y_flat, Z_flat, c=field_flat, cmap=cmap,
+                      s=5, alpha=0.8, edgecolors='none')
+
+    # 设置坐标轴和标题
+    ax.set_xlabel('X (normalized)', fontsize=8)
+    ax.set_ylabel('Y (normalized)', fontsize=8)
+    ax.set_zlabel('Z (normalized)', fontsize=8)
+    ax.set_title(title, fontsize=10, pad=10)
+    ax.tick_params(labelsize=6)
+
+    return surf
+
+
+def plot_3d_fields_batch(X, Y, Z, physics_fields, sample_indices=[0, 1], figsize=(18, 12)):
+
+    # 定义场名称和颜色映射
+    field_configs = [
+        ('Temperature', 0, 'RdYlBu_r'),
+        ('Velocity', 1, 'viridis'),
+        ('Pressure', 2, 'plasma')
+    ]
+
+    # 创建2行3列的子图
+    fig = plt.figure(figsize=figsize)
+
+    # 第一行：第一个样本的3个场
+    for col, (field_name, field_idx, cmap) in enumerate(field_configs):
+        ax = fig.add_subplot(2, 3, col + 1, projection='3d')
+        surf = plot_3d_field_3d(
+            ax, X, Y, Z,
+            physics_fields[sample_indices[0], :, :, :, field_idx],
+            title=f'Sample {sample_indices[0] + 1} - {field_name} (3D)',
+            cmap=cmap
+        )
+        cbar = fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1)
+        cbar.set_label('Normalized Value', fontsize=8)
+        cbar.ax.tick_params(labelsize=6)
+
+    # 第二行：第二个样本的3个场
+    for col, (field_name, field_idx, cmap) in enumerate(field_configs):
+        ax = fig.add_subplot(2, 3, col + 4, projection='3d')
+        surf = plot_3d_field_3d(
+            ax, X, Y, Z,
+            physics_fields[sample_indices[1], :, :, :, field_idx],
+            title=f'Sample {sample_indices[1] + 1} - {field_name} (3D)',
+            cmap=cmap
+        )
+
+        cbar = fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1)
+        cbar.set_label('Normalized Value', fontsize=8)
+        cbar.ax.tick_params(labelsize=6)
+
+    # 总标题和布局调整
+    plt.suptitle('3D Turbine Vane Physics Fields (2 Samples × 3 Fields)', fontsize=14, y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
+
+
+def plot_3d_comparison_3d(X, Y, Z, Z_true_3d, Z_pred_3d, field_name, sample_idx, figsize=(16, 7)):
+    """绘制单场的3D真实值vs预测值对比"""
+    fig = plt.figure(figsize=figsize)
+    cmaps = {'Temperature': 'RdYlBu_r', 'Velocity': 'viridis', 'Pressure': 'plasma'}
+
+    # 真实场
+    ax1 = fig.add_subplot(1, 2, 1, projection='3d')
+    surf1 = plot_3d_field_3d(
+        ax1, X, Y, Z, Z_true_3d,
+        title=f'True {field_name} (Sample {sample_idx + 1}, 3D)',
+        cmap=cmaps[field_name]
+    )
+    cbar1 = fig.colorbar(surf1, ax=ax1, shrink=0.6, pad=0.1)
+    cbar1.set_label('Normalized Value', fontsize=8)
+    cbar1.ax.tick_params(labelsize=6)
+
+    # 预测场
+    ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+    surf2 = plot_3d_field_3d(
+        ax2, X, Y, Z, Z_pred_3d,
+        title=f'Predicted {field_name} (Sample {sample_idx + 1}, 3D)',
+        cmap=cmaps[field_name]
+    )
+    cbar2 = fig.colorbar(surf2, ax=ax2, shrink=0.6, pad=0.1)
+    cbar2.set_label('Normalized Value', fontsize=8)
+    cbar2.ax.tick_params(labelsize=6)
+
+    plt.suptitle(f'3D {field_name} Field Comparison (Sample {sample_idx + 1})', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+
+print("\n=== PLOTTING 3D FIELD (RAW DATA) ===")
+plot_3d_fields_batch(X, Y, Z, physics_fields, sample_indices=[0, 1], figsize=(18, 12))
+
+
+class LSTM_MLP_PINN(nn.Module):
+    def __init__(self, lstm_input_dim=3, lstm_hidden_dim=64, lstm_num_layers=2,
+                 mlp_hidden_dim=64, num_scalar_params=12, grid_size=20):
+        super(LSTM_MLP_PINN, self).__init__()
+
+        self.lstm_hidden_dim = lstm_hidden_dim
+        self.num_scalar_params = num_scalar_params
+        self.grid_size = grid_size
+        self.num_spatial_points = grid_size ** 3  # 3D总点数
+
+        # LSTM模块（处理冷却参数序列）
+        self.lstm = nn.LSTM(
+            input_size=lstm_input_dim,
+            hidden_size=lstm_hidden_dim,
+            num_layers=lstm_num_layers,
+            batch_first=True,
+            bidirectional=False
+        )
+
+        # MLP模块（输入：LSTM特征 + 标量参数 + 3D坐标）
+        mlp_input_dim = lstm_hidden_dim + num_scalar_params + 3  # 64 + 12 + 3 = 79
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_input_dim, mlp_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(mlp_hidden_dim, mlp_hidden_dim * 2),
+            nn.Tanh(),
+            nn.Linear(mlp_hidden_dim * 2, mlp_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(mlp_hidden_dim, 3)  # 输出：T/V/P
+        )
+
+    def forward(self, cooling_sequence, model_params_batch, requires_grad=True):
+        """Forward pass for 3D PINN"""
+        batch_size = cooling_sequence.shape[0]
+
+        # 1. LSTM处理冷却参数序列
+        lstm_out, _ = self.lstm(cooling_sequence)
+        sequence_features = lstm_out[:, -1, :]  # [batch, 64]
+        sequence_features_expanded = sequence_features.unsqueeze(1).repeat(
+            1, self.num_spatial_points, 1
+        )  # [batch, N, 64]
+
+        # 2. 分离标量参数和3D空间坐标
+        scalar_params = model_params_batch[:, :, :self.num_scalar_params]  # [batch, N, 12]
+        spatial_coords = model_params_batch[:, :, self.num_scalar_params:]  # [batch, N, 3] (x,y,z)
+
+        if requires_grad:
+            spatial_coords.requires_grad_(True)
+
+        # 3. 拼接所有特征
+        mlp_input = torch.cat([
+            sequence_features_expanded,
+            scalar_params,
+            spatial_coords
+        ], dim=-1)  # [batch, N, 79]
+
+        # 4. 预测3D物理场
+        physics_fields_flat = self.mlp(mlp_input)  # [batch, N, 3]
+        # 重塑为3D形状 [batch, x, y, z, 3]
+        physics_fields = physics_fields_flat.reshape(
+            batch_size, self.grid_size, self.grid_size, self.grid_size, 3
+        )
+
+        return physics_fields, spatial_coords
+
+
+# 初始化3D模型
+print("\n=== 3D LSTM-MLP-PINN ARCHITECTURE ===")
+model = LSTM_MLP_PINN(
+    lstm_input_dim=3, lstm_hidden_dim=64, lstm_num_layers=2,
+    mlp_hidden_dim=64, num_scalar_params=12, grid_size=grid_size
+)
+model = model.to(device)
+
+total_params = sum(p.numel() for p in model.parameters())
+print(f"3D LSTM-MLP-PINN Architecture:")
+print(f"- LSTM hidden dimension: {model.lstm_hidden_dim}")
+print(f"- MLP input dimension: {64 + 12 + 3}")
+print(f"- Grid size: {grid_size}×{grid_size}×{grid_size}")
+print(f"- Total parameters: {total_params:,}")
+
+
+def compute_gradient(output, inputs):
+    """计算输出对输入的梯度（3D）"""
+    if not output.requires_grad:
+        output = output.requires_grad_(True)
+
+    # 统一输出形状为 [batch, N, 1]
+    if len(output.shape) == 2:
+        output = output.unsqueeze(-1)
+    grad = torch.autograd.grad(
+        outputs=output,
+        inputs=inputs,
+        grad_outputs=torch.ones_like(output),
+        create_graph=True,
+        retain_graph=True,
+        allow_unused=True
+    )[0]
+    return grad if grad is not None else torch.zeros_like(inputs)
+
+
+def compute_divergence(grad, spatial_coords, dim=3):
+    """计算梯度的散度（3D）"""
+    # grad shape: [batch, N, dim]
+    divergence = torch.zeros_like(grad[..., 0], device=grad.device)
+    for d in range(dim):
+        # 修复：计算梯度的第d维 对 空间坐标的第d维 的偏导数
+        d2 = compute_gradient(grad[..., d:d + 1], spatial_coords)[..., d]
+        divergence += d2
+
+    return divergence
+
+
+def compute_physics_loss(u_pred, p_pred, spatial_coords):
+    """
+    计算3D NS方程的残差MSE（MSEg1）
+    :param u_pred: 预测速度场 [batch, N, 1]
+    :param p_pred: 预测压力场 [batch, N, 1]
+    :param spatial_coords: 3D空间坐标 [batch, N, 3] (x,y,z)
+    :return: NS方程残差的MSE损失
+    """
+    # NS方程常数
+    rho = 1.225  # 空气密度 kg/m³
+    nu = 1.5e-5  # 运动粘度 m²/s
+    batch_size = u_pred.shape[0]
+    num_points = u_pred.shape[1]
+
+    # 1. 计算连续性方程项：∇⋅(ρV) （稳态，∂ρ/∂t=0）
+    rho_u = rho * u_pred  # [batch, N, 1]
+    grad_rho_u = compute_gradient(rho_u, spatial_coords)  # [batch, N, 3]
+    div_rho_u = compute_divergence(grad_rho_u, spatial_coords)  # [batch, N] 连续性方程散度项
+
+    # 2. 计算动量方程项
+    # 2.1 对流项：∇⋅(VV)
+    u_squared = u_pred * u_pred  # V·V [batch, N, 1]
+    grad_u2 = compute_gradient(u_squared, spatial_coords)  # [batch, N, 3]
+    div_u2 = compute_divergence(grad_u2, spatial_coords)  # [batch, N] 对流项散度
+
+    # 2.2 压力梯度项：(1/ρ)∇P
+    grad_p = compute_gradient(p_pred, spatial_coords)  # [batch, N, 3]
+    grad_p_mag = torch.norm(grad_p, dim=-1)  # 压力梯度的模 [batch, N]
+    pressure_term = (1 / rho) * grad_p_mag  # [batch, N]
+
+    # 2.3 粘性项：∇⋅(ν∇V)
+    grad_u = compute_gradient(u_pred, spatial_coords)  # [batch, N, 3]
+    nu_grad_u = nu * grad_u  # [batch, N, 3]
+    div_nu_grad_u = compute_divergence(nu_grad_u, spatial_coords)  # [batch, N] 粘性项散度
+
+    # 2.4 动量方程总项（稳态，∂V/∂t=0）
+    momentum_term = div_u2 + pressure_term - div_nu_grad_u  # [batch, N]
+
+    # 3. NS方程总残差（连续性 + 动量）
+    ns_residual = div_rho_u + momentum_term + 1e-6  # [batch, N]
+
+    # 4. 计算MSEg1（对应公式的均值平方误差）
+    mse_g1 = torch.mean(ns_residual ** 2)
+
+    return mse_g1
+
+
+def physics_informed_loss_3d(model, cooling_batch, params_batch, physics_true_batch,
+                             lambda_physics=1.0, lambda_boundary=0.1, is_training=True):
+    """3D PINN损失函数（NS方程物理损失）"""
+    # Forward pass
+    physics_pred, spatial_coords = model(cooling_batch, params_batch, requires_grad=is_training)
+
+    # 展平用于损失计算
+    num_spatial_points = model.num_spatial_points
+    physics_true_flat = physics_true_batch.reshape(
+        physics_true_batch.shape[0], num_spatial_points, 3
+    )  # [batch, N, 3] (T/V/P)
+    physics_pred_flat = physics_pred.reshape(
+        physics_pred.shape[0], num_spatial_points, 3
+    )  # [batch, N, 3]
+
+    # 1. 数据损失（预测值与真实值的MSE）
+    data_loss = torch.mean((physics_pred_flat - physics_true_flat) ** 2)
+
+    # 2. NS方程物理损失
+
+    physics_loss = torch.tensor(0.0, device=device)
+    if is_training and spatial_coords.requires_grad:
+        # 训练阶段：正常计算物理损失
+        u_pred = physics_pred_flat[:, :, 1:2]  # 速度场
+        p_pred = physics_pred_flat[:, :, 2:3]  # 压力场
+        physics_loss = compute_physics_loss(u_pred, p_pred, spatial_coords)
+    elif not is_training:
+        # 验证阶段：临时启用梯度计算物理损失
+        with torch.enable_grad():
+            u_pred = physics_pred_flat[:, :, 1:2].detach().requires_grad_(True)
+            p_pred = physics_pred_flat[:, :, 2:3].detach().requires_grad_(True)
+            spatial_coords_val = spatial_coords.detach().requires_grad_(True)
+            physics_loss = compute_physics_loss(u_pred, p_pred, spatial_coords_val)
+            physics_loss = physics_loss.detach()
+
+    # 3. 3D边界损失（六个面）
+    T_pred = physics_pred  # [batch, x, y, z, 0] 温度场
+    # x方向边界 (x=0, x=-1)
+    T_x0 = T_pred[:, 0, :, :, 0]
+    T_x1 = T_pred[:, -1, :, :, 0]
+    # y方向边界 (y=0, y=-1)
+    T_y0 = T_pred[:, :, 0, :, 0]
+    T_y1 = T_pred[:, :, -1, :, 0]
+    # z方向边界 (z=0, z=-1)
+    T_z0 = T_pred[:, :, :, 0, 0]
+    T_z1 = T_pred[:, :, :, -1, 0]
+
+    # 3D边界目标值
+    T_bound_target = torch.tensor([0.8, 0.6, 0.7, 0.5, 0.9, 0.4], device=device)  # 需根据数据集修改
+    boundary_loss = torch.mean(
+        (T_x0 - T_bound_target[0]) ** 2 +
+        (T_x1 - T_bound_target[1]) ** 2 +
+        (T_y0 - T_bound_target[2]) ** 2 +
+        (T_y1 - T_bound_target[3]) ** 2 +
+        (T_z0 - T_bound_target[4]) ** 2 +
+        (T_z1 - T_bound_target[5]) ** 2
+    )
+
+    # 总损失
+    total_loss = data_loss + lambda_physics * physics_loss + lambda_boundary * boundary_loss
+
+    return total_loss, data_loss, physics_loss, boundary_loss
+
+
+def setup_data_loaders_3d(cooling_params, model_params, physics_fields, batch_size=32):
+    """创建3D数据加载器"""
+    train_size = int(0.8 * len(cooling_params))
+    val_size = int(0.1 * len(cooling_params))
+
+    # 划分数据集
+    train_cooling = cooling_params[:train_size]
+    train_params = model_params[:train_size]
+    train_physics = physics_fields[:train_size]
+
+    val_cooling = cooling_params[train_size:train_size + val_size]
+    val_params = model_params[train_size:train_size + val_size]
+    val_physics = physics_fields[train_size:train_size + val_size]
+
+    test_cooling = cooling_params[train_size + val_size:]
+    test_params = model_params[train_size + val_size:]
+    test_physics = physics_fields[train_size + val_size:]
+
+    # 创建Dataset
+    train_dataset = TensorDataset(
+        torch.tensor(train_cooling, dtype=torch.float32),
+        torch.tensor(train_params, dtype=torch.float32),
+        torch.tensor(train_physics, dtype=torch.float32)
+    )
+
+    val_dataset = TensorDataset(
+        torch.tensor(val_cooling, dtype=torch.float32),
+        torch.tensor(val_params, dtype=torch.float32),
+        torch.tensor(val_physics, dtype=torch.float32)
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    return train_loader, val_loader, (test_cooling, test_params, test_physics)
+
+
+# 设置3D数据加载器
+print("\n=== 3D TRAINING SETUP ===")
+train_loader, val_loader, test_data = setup_data_loaders_3d(
+    cooling_params, model_params, physics_fields, batch_size=2
+)
+
+print(f"Training samples: {len(train_loader.dataset)}")
+print(f"Validation samples: {len(val_loader.dataset)}")
+print(f"Test samples: {len(test_data[0])}")
+print(f"Training batches: {len(train_loader)}")
+
+
+def train_physics_informed_model_3d(model, train_loader, val_loader,
+                                    num_epochs=1000, lr=0.001,
+                                    lambda_physics=1.0, lambda_boundary=0.1):
+    """训练3D PINN模型"""
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+
+    train_losses = {'total': [], 'data': [], 'physics': [], 'boundary': []}
+    val_losses = {'total': [], 'data': [], 'physics': [], 'boundary': []}
+
+    best_val_loss = float('inf')
+    patience = 10
+    patience_counter = 0
+
+    pbar = tqdm(range(num_epochs), desc="Training 3D LSTM-MLP-PINN")
+
+    for epoch in pbar:
+        # 训练阶段
+        model.train()
+        train_loss_epoch = {'total': 0, 'data': 0, 'physics': 0, 'boundary': 0}
+
+        for cooling_batch, params_batch, physics_batch in train_loader:
+            cooling_batch = cooling_batch.to(device)
+            params_batch = params_batch.to(device)
+            physics_batch = physics_batch.to(device)
+
+            optimizer.zero_grad()
+            total_loss, data_loss, physics_loss, boundary_loss = physics_informed_loss_3d(
+                model, cooling_batch, params_batch, physics_batch,
+                lambda_physics=lambda_physics, lambda_boundary=lambda_boundary,
+                is_training=True
+            )
+
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            train_loss_epoch['total'] += total_loss.item()
+            train_loss_epoch['data'] += data_loss.item()
+            train_loss_epoch['physics'] += physics_loss.item()
+            train_loss_epoch['boundary'] += boundary_loss.item()
+
+        # 验证阶段
+        model.eval()
+        val_loss_epoch = {'total': 0, 'data': 0, 'physics': 0, 'boundary': 0}
+
+        with torch.no_grad():
+            for cooling_batch, params_batch, physics_batch in val_loader:
+                cooling_batch = cooling_batch.to(device)
+                params_batch = params_batch.to(device)
+                physics_batch = physics_batch.to(device)
+
+                # 修改这里：验证阶段也需要计算物理损失
+                total_loss, data_loss, physics_loss, boundary_loss = physics_informed_loss_3d(
+                    model, cooling_batch, params_batch, physics_batch,
+                    lambda_physics=lambda_physics, lambda_boundary=lambda_boundary,
+                    is_training=False
+                )
+
+                val_loss_epoch['total'] += total_loss.item()
+                val_loss_epoch['data'] += data_loss.item()
+                val_loss_epoch['physics'] += physics_loss.item()
+                val_loss_epoch['boundary'] += boundary_loss.item()
+
+        # 平均损失
+        for key in train_loss_epoch:
+            train_loss_epoch[key] /= len(train_loader)
+            val_loss_epoch[key] /= len(val_loader)
+            train_losses[key].append(train_loss_epoch[key])
+            val_losses[key].append(val_loss_epoch[key])
+
+        scheduler.step(val_loss_epoch['total'])
+
+        # 更新进度条
+        pbar.set_postfix({
+            'Total': f'{train_loss_epoch["total"]:.2e}',
+            'Data': f'{train_loss_epoch["data"]:.2e}',
+            'NS Physics': f'{train_loss_epoch["physics"]:.2e}',
+            'Boundary': f'{train_loss_epoch["boundary"]:.2e}',
+            'LR': f'{optimizer.param_groups[0]["lr"]:.2e}'
+        })
+
+        # 早停机制
+        if val_loss_epoch['total'] < best_val_loss:
+            best_val_loss = val_loss_epoch['total']
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f'\nEarly stopping at epoch {epoch}')
+                break
+
+    pbar.close()
+    return train_losses, val_losses
+
+
+# 开始训练
+print("\nStarting physics-informed training ...")
+train_losses, val_losses = train_physics_informed_model_3d(
+    model, train_loader, val_loader,
+    num_epochs=1000, lr=0.001,
+    lambda_physics=1.0, lambda_boundary=0.1
+)
+
+# 打印训练结果
+print("\nTraining completed!")
+print(f"Final training losses:")
+print(f"  Total: {train_losses['total'][-1]:.2e}")
+print(f"  Data: {train_losses['data'][-1]:.2e}")
+print(f"  NS Physics: {train_losses['physics'][-1]:.2e}")
+print(f"  Boundary: {train_losses['boundary'][-1]:.2e}")
+
+# 绘制训练曲线
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+# 总损失
+axes[0, 0].plot(train_losses['total'], label='Training', alpha=0.8, linewidth=2)
+axes[0, 0].plot(val_losses['total'], label='Validation', alpha=0.8, linewidth=2)
+axes[0, 0].set_title('Total Loss (3D NS)')
+axes[0, 0].set_xlabel('Epoch')
+axes[0, 0].set_ylabel('Loss')
+axes[0, 0].set_yscale('log')
+axes[0, 0].legend()
+axes[0, 0].grid(True, alpha=0.3)
+
+# 数据损失
+axes[0, 1].plot(train_losses['data'], label='Training', alpha=0.8, linewidth=2)
+axes[0, 1].plot(val_losses['data'], label='Validation', alpha=0.8, linewidth=2)
+axes[0, 1].set_title('Data Loss (3D NS)')
+axes[0, 1].set_xlabel('Epoch')
+axes[0, 1].set_ylabel('Loss')
+axes[0, 1].set_yscale('log')
+axes[0, 1].legend()
+axes[0, 1].grid(True, alpha=0.3)
+
+# NS物理损失
+axes[1, 0].plot(train_losses['physics'], label='Training', alpha=0.8, linewidth=2)
+axes[1, 0].plot(val_losses['physics'], label='Validation', alpha=0.8, linewidth=2)
+axes[1, 0].set_title('NS Physics Loss (3D)')
+axes[1, 0].set_xlabel('Epoch')
+axes[1, 0].set_ylabel('Loss')
+axes[1, 0].set_yscale('log')
+axes[1, 0].legend()
+axes[1, 0].grid(True, alpha=0.3)
+
+# 3D边界损失
+axes[1, 1].plot(train_losses['boundary'], label='Training', alpha=0.8, linewidth=2)
+axes[1, 1].plot(val_losses['boundary'], label='Validation', alpha=0.8, linewidth=2)
+axes[1, 1].set_title('Boundary Loss (3D NS)')
+axes[1, 1].set_xlabel('Epoch')
+axes[1, 1].set_ylabel('Loss')
+axes[1, 1].set_yscale('log')
+axes[1, 1].legend()
+axes[1, 1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+
+def evaluate_model_3d(model, test_data):
+    """评估3D模型性能"""
+    test_cooling, test_params, test_physics = test_data
+    model.eval()
+
+    test_cooling_tensor = torch.tensor(test_cooling, dtype=torch.float32).to(device)
+    test_params_tensor = torch.tensor(test_params, dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        physics_pred, _ = model(test_cooling_tensor, test_params_tensor, requires_grad=False)
+        physics_pred = physics_pred.cpu().numpy()
+
+    # 计算MSE
+    num_spatial_points = model.num_spatial_points
+    test_physics_flat = test_physics.reshape(test_physics.shape[0], num_spatial_points, 3)
+    physics_pred_flat = physics_pred.reshape(physics_pred.shape[0], num_spatial_points, 3)
+
+    errors_T = np.mean((physics_pred_flat[:, :, 0] - test_physics_flat[:, :, 0]) ** 2, axis=1)
+    errors_V = np.mean((physics_pred_flat[:, :, 1] - test_physics_flat[:, :, 1]) ** 2, axis=1)
+    errors_P = np.mean((physics_pred_flat[:, :, 2] - test_physics_flat[:, :, 2]) ** 2, axis=1)
+
+    avg_error_T = np.mean(errors_T)
+    avg_error_V = np.mean(errors_V)
+    avg_error_P = np.mean(errors_P)
+
+    print(f"\n=== 3D MODEL EVALUATION ===")
+    print(f"Evaluation Results on Test Set:")
+    print(f"  Average MSE - Temperature: {avg_error_T:.6f}")
+    print(f"  Average MSE - Velocity: {avg_error_V:.6f}")
+    print(f"  Average MSE - Pressure: {avg_error_P:.6f}")
+    print(f"  Overall Average MSE: {(avg_error_T + avg_error_V + avg_error_P) / 3:.6f}")
+
+    return physics_pred, errors_T, errors_V, errors_P
+
+
+# 模型评估
+physics_pred, errors_T, errors_V, errors_P = evaluate_model_3d(model, test_data)
+
+print("\n=== PLOTTING 3D PREDICTION COMPARISONS ===")
+for sample_idx in range(2):
+    # 温度场3D对比
+    plot_3d_comparison_3d(
+        X, Y, Z,
+        test_data[2][sample_idx, :, :, :, 0],  # 真实温度场
+        physics_pred[sample_idx, :, :, :, 0],  # 预测温度场
+        field_name='Temperature',
+        sample_idx=sample_idx,
+        figsize=(16, 7)
+    )
+
+    # 速度场3D对比
+    plot_3d_comparison_3d(
+        X, Y, Z,
+        test_data[2][sample_idx, :, :, :, 1],  # 真实速度场
+        physics_pred[sample_idx, :, :, :, 1],  # 预测速度场
+        field_name='Velocity',
+        sample_idx=sample_idx,
+        figsize=(16, 7)
+    )
+
+    # 压力场3D对比
+    plot_3d_comparison_3d(
+        X, Y, Z,
+        test_data[2][sample_idx, :, :, :, 2],  # 真实压力场
+        physics_pred[sample_idx, :, :, :, 2],  # 预测压力场
+        field_name='Pressure',
+        sample_idx=sample_idx,
+        figsize=(16, 7)
+    )
+
+# 误差分布可视化
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+# 温度误差
+axes[0].hist(errors_T, bins=10, alpha=0.7, edgecolor='black', color='red')
+axes[0].axvline(np.mean(errors_T), color='black', linestyle='--',
+                label=f'Mean: {np.mean(errors_T):.4f}')
+axes[0].set_title('3D Temperature Error Distribution (NS)')
+axes[0].set_xlabel('MSE')
+axes[0].set_ylabel('Frequency')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+# 速度误差
+axes[1].hist(errors_V, bins=10, alpha=0.7, edgecolor='black', color='green')
+axes[1].axvline(np.mean(errors_V), color='black', linestyle='--',
+                label=f'Mean: {np.mean(errors_V):.4f}')
+axes[1].set_title('3D Velocity Error Distribution (NS)')
+axes[1].set_xlabel('MSE')
+axes[1].set_ylabel('Frequency')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+# 压力误差
+axes[2].hist(errors_P, bins=10, alpha=0.7, edgecolor='black', color='blue')
+axes[2].axvline(np.mean(errors_P), color='black', linestyle='--',
+                label=f'Mean: {np.mean(errors_P):.4f}')
+axes[2].set_title('3D Pressure Error Distribution (NS)')
+axes[2].set_xlabel('MSE')
+axes[2].set_ylabel('Frequency')
+axes[2].legend()
+axes[2].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
