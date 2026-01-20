@@ -1,0 +1,643 @@
+import numpy as np
+import warnings
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib import cm
+
+warnings.filterwarnings('ignore')
+
+# Set style and random seeds
+np.random.seed(42)
+torch.manual_seed(42)
+
+
+# Device selection
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
+device = get_device()
+print(f"Using device: {device}")
+
+
+def generate_turbine_data_2d(num_samples=1000, grid_size=50, num_cooling_inlets=9):
+    """Generate 2D turbine vane data with cooling parameters """
+    x = np.linspace(0, 1, grid_size)
+    y = np.linspace(0, 1, grid_size)
+    X, Y = np.meshgrid(x, y)
+    grid_shape = (grid_size, grid_size)
+
+    # 初始化数据结构
+    cooling_params = np.zeros((num_samples, num_cooling_inlets, 3))
+    physics_fields = np.zeros((num_samples, grid_size, grid_size, 3))
+    model_params_list = []
+
+    for i in range(num_samples):
+        # 生成冷却参数序列 (Tcn, ṁcn, Icn)(随机0-1)
+        for n in range(num_cooling_inlets):
+            T_cn = np.random.uniform(0.0, 0.9)
+            m_cn = np.random.uniform(0.1, 0.9)
+            I_cn = np.random.uniform(0.1, 0.9)
+            cooling_params[i, n] = [T_cn, m_cn, I_cn]
+
+        # 2. 结构参数 (5个)
+        material_property = np.random.uniform(0.1, 1.5)
+        geometry_param = np.random.uniform(0.1, 1.2)
+        flow_field_char = np.random.uniform(0.1, 1.3)
+        blade_thickness = np.random.uniform(0.1, 0.3)
+        chord_length = np.random.uniform(0.1, 1.2)
+        # 操作参数 (7个)
+        inlet_pressure = np.random.uniform(0.1, 1.2)
+        inlet_velocity = np.random.uniform(0.1, 1.4)
+        boundary_condition = np.random.uniform(0.0, 1.0)
+        gas_density = np.random.uniform(0.7, 1.3)
+        gas_specific_heat = np.random.uniform(0.1, 1.1)
+        gas_mass_flow = np.random.uniform(0.5, 1.5)
+        reynolds_number = np.random.uniform(10000, 500000)
+        reynolds_norm = (reynolds_number - 10000) / 490000
+
+        scalar_params = np.array([
+            material_property, geometry_param, flow_field_char, blade_thickness, chord_length,
+            inlet_pressure, inlet_velocity, boundary_condition, gas_density,
+            gas_specific_heat, gas_mass_flow, reynolds_norm
+        ])
+
+        # 3. 组合标量参数和二维空间坐标
+        X_flat = X.flatten()
+        Y_flat = Y.flatten()
+        scalar_params_expanded = np.tile(scalar_params, (grid_size * grid_size, 1))
+        combined_params = np.hstack([scalar_params_expanded, X_flat.reshape(-1, 1), Y_flat.reshape(-1, 1)])
+        model_params_list.append(combined_params)
+
+        # 4. 生成二维物理场数据
+        avg_T_cooling = np.mean(cooling_params[i, :, 0])
+        avg_m_cooling = np.mean(cooling_params[i, :, 1])
+        avg_I_cooling = np.mean(cooling_params[i, :, 2])
+
+        # 需根据数据集修改
+        T_field = (1 - 0.5 * avg_T_cooling) * (
+                1 - 0.3 * np.sin(np.pi * X) * np.cos(np.pi * Y)) + 0.2 * material_property
+        V_field = inlet_velocity * (0.8 + 0.4 * np.sin(2 * np.pi * X) * np.sin(np.pi * Y)) + 0.1 * avg_m_cooling
+        P_field = inlet_pressure * (1 - 0.2 * avg_I_cooling) * (1 - 0.15 * np.cos(np.pi * X) * np.cos(2 * np.pi * Y))
+
+        physics_fields[i, :, :, 0] = T_field
+        physics_fields[i, :, :, 1] = V_field
+        physics_fields[i, :, :, 2] = P_field
+
+    model_params = np.array(model_params_list)
+    return cooling_params, model_params, physics_fields, X, Y
+
+
+# 生成二维数据
+print("=== GENERATING 2D TURBINE VANE DATA ===")
+grid_size = 50
+cooling_params, model_params, physics_fields, X, Y = generate_turbine_data_2d(
+    num_samples=1000, grid_size=50, num_cooling_inlets=9
+)
+
+print(f"Generated {len(cooling_params)} turbine samples")
+print(f"Cooling parameters shape: {cooling_params.shape}")
+print(f"Model parameters shape: {model_params.shape}")
+print(f"Physics fields shape: {physics_fields.shape}")
+print(f"Spatial domain: x,y ∈ [0, 1] with {grid_size}×{grid_size} grid points")
+
+
+def plot_3d_fields_two_samples(X, Y, physics_fields, sample_indices=[0, 1], figsize=(18, 12)):
+
+    fig = plt.figure(figsize=figsize)
+    field_names = ['Temperature', 'Velocity', 'Pressure']
+    cmaps = ['RdYlBu_r', 'viridis', 'plasma']
+
+    for row_idx, sample_idx in enumerate(sample_indices):
+        for col_idx, (field_name, cmap) in enumerate(zip(field_names, cmaps)):
+            # 创建子图：2行3列，位置为 row_idx*3 + col_idx +1
+            ax = fig.add_subplot(2, 3, row_idx * 3 + col_idx + 1, projection='3d')
+            field_data = physics_fields[sample_idx, :, :, col_idx]
+
+            surf = ax.plot_surface(X, Y, field_data,
+                                   cmap=cmap,
+                                   linewidth=0,
+                                   antialiased=True,
+                                   alpha=0.8)
+            fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, label='Normalized Value')
+            ax.set_xlabel('X (normalized)', fontsize=9)
+            ax.set_ylabel('Y (normalized)', fontsize=9)
+            ax.set_zlabel(field_name, fontsize=9)
+            ax.set_title(f'Sample {sample_idx + 1} - {field_name} Field', fontsize=11, pad=15)
+            ax.view_init(elev=30, azim=45)
+
+    plt.suptitle('2D Turbine Vane Physics Fields (Two Samples)', fontsize=16, y=0.98)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_3d_comparison_two_samples(X, Y, physics_true, physics_pred, sample_indices=[0, 1], figsize=(24, 16)):
+
+    fig = plt.figure(figsize=figsize)
+    field_names = ['Temperature', 'Velocity', 'Pressure']
+    cmaps = ['RdYlBu_r', 'viridis', 'plasma']
+
+    for row_idx, sample_idx in enumerate(sample_indices):
+        for col_group, (field_name, cmap) in enumerate(zip(field_names, cmaps)):
+            # 真实场：位置 row_idx*6 + col_group*2 +1
+            ax_true = fig.add_subplot(2, 6, row_idx * 6 + col_group * 2 + 1, projection='3d')
+            field_true = physics_true[sample_idx, :, :, col_group]
+            surf_true = ax_true.plot_surface(X, Y, field_true,
+                                             cmap=cmap,
+                                             linewidth=0,
+                                             antialiased=True,
+                                             alpha=0.8)
+            fig.colorbar(surf_true, ax=ax_true, shrink=0.4, aspect=8, label='Normalized Value')
+            ax_true.set_xlabel('X', fontsize=8)
+            ax_true.set_ylabel('Y', fontsize=8)
+            ax_true.set_zlabel(field_name, fontsize=8)
+            ax_true.set_title(f'Sample {sample_idx + 1} - True {field_name}', fontsize=10, pad=10)
+            ax_true.view_init(elev=30, azim=45)
+
+            # 预测场：位置 row_idx*6 + col_group*2 +2
+            ax_pred = fig.add_subplot(2, 6, row_idx * 6 + col_group * 2 + 2, projection='3d')
+            field_pred = physics_pred[sample_idx, :, :, col_group]
+            surf_pred = ax_pred.plot_surface(X, Y, field_pred,
+                                             cmap=cmap,
+                                             linewidth=0,
+                                             antialiased=True,
+                                             alpha=0.8)
+            fig.colorbar(surf_pred, ax=ax_pred, shrink=0.4, aspect=8, label='Normalized Value')
+            ax_pred.set_xlabel('X', fontsize=8)
+            ax_pred.set_ylabel('Y', fontsize=8)
+            ax_pred.set_zlabel(field_name, fontsize=8)
+            ax_pred.set_title(f'Sample {sample_idx + 1} - Pred {field_name}', fontsize=10, pad=10)
+            ax_pred.view_init(elev=30, azim=45)
+
+    plt.suptitle('2D Turbine Vane Physics Fields Comparison (Two Samples)', fontsize=18, y=0.98)
+    plt.tight_layout()
+    plt.show()
+
+
+# 调用原始场图绘制：两个样本，2行3列
+print("\n=== PLOTTING 3D FIELDS FOR RAW DATA ===")
+plot_3d_fields_two_samples(X, Y, physics_fields, sample_indices=[0, 1])
+
+
+class LSTM_MLP_PINN(nn.Module):
+    def __init__(self, lstm_input_dim=3, lstm_hidden_dim=64, lstm_num_layers=2,
+                 mlp_hidden_dim=128, num_scalar_params=12, grid_size=50):
+        super(LSTM_MLP_PINN, self).__init__()
+
+        self.lstm_hidden_dim = lstm_hidden_dim
+        self.num_scalar_params = num_scalar_params
+        self.grid_size = grid_size
+        self.num_spatial_points = grid_size * grid_size
+
+        # LSTM模块
+        self.lstm = nn.LSTM(
+            input_size=lstm_input_dim,
+            hidden_size=lstm_hidden_dim,
+            num_layers=lstm_num_layers,
+            batch_first=True,
+            bidirectional=False
+        )
+
+        # MLP模块
+        self.mlp = nn.Sequential(
+            nn.Linear(lstm_hidden_dim + num_scalar_params + 2, mlp_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(mlp_hidden_dim, 3)  # T, V, P
+        )
+
+    def forward(self, cooling_sequence, model_params_batch, requires_grad=True):
+        """Forward pass for 2D PINN"""
+        batch_size = cooling_sequence.shape[0]
+
+        # 1. LSTM处理冷却参数
+        lstm_out, _ = self.lstm(cooling_sequence)
+        sequence_features = lstm_out[:, -1, :]  # [batch, 32]
+        sequence_features_expanded = sequence_features.unsqueeze(1).repeat(1, self.num_spatial_points, 1)
+
+        # 2. 分离标量参数和空间坐标
+        scalar_params = model_params_batch[:, :, :self.num_scalar_params]
+        spatial_coords = model_params_batch[:, :, self.num_scalar_params:]
+
+        if requires_grad:
+            spatial_coords = spatial_coords.clone().detach().requires_grad_(True)
+
+        # 3. 拼接特征
+        mlp_input = torch.cat([
+            sequence_features_expanded,
+            scalar_params,
+            spatial_coords
+        ], dim=-1)
+
+        # 4. 预测物理场
+        physics_fields_flat = self.mlp(mlp_input)
+        physics_fields = physics_fields_flat.reshape(
+            batch_size, self.grid_size, self.grid_size, 3
+        )
+
+        return physics_fields, spatial_coords
+
+
+# 初始化二维模型
+print("\n=== 2D LSTM-MLP-PINN ARCHITECTURE ===")
+model = LSTM_MLP_PINN(
+    lstm_input_dim=3, lstm_hidden_dim=64, lstm_num_layers=2,
+    mlp_hidden_dim=128, num_scalar_params=12, grid_size=grid_size
+)
+model = model.to(device)
+
+total_params = sum(p.numel() for p in model.parameters())
+print(f"2D LSTM-MLP-PINN Architecture:")
+print(f"- LSTM hidden dimension: {model.lstm_hidden_dim}")
+print(f"- MLP input dimension: {64 + 12 + 2}")
+print(f"- Grid size: {grid_size}×{grid_size}")
+print(f"- Total parameters: {total_params:,}")
+
+
+def compute_physics_loss_2d(u, spatial_coords):
+    """
+    计算二维物理损失 (泊松方程)
+    """
+    batch_size = u.shape[0]
+    num_points = u.shape[1]
+
+    # 初始化梯度存储
+    laplacian_u = torch.zeros_like(u, device=device)
+
+    # 逐样本计算梯度
+    for b in range(batch_size):
+        # 提取单个样本
+        u_b = u[b:b + 1, :, :]  # [1, num_points, 1]
+        coords_b = spatial_coords[b:b + 1, :, :]  # [1, num_points, 2]
+
+        # 确保张量可导
+        u_b.requires_grad_(True)
+        coords_b.requires_grad_(True)
+
+        # 计算一阶偏导数 du/dx, du/dy
+        grad_u = torch.autograd.grad(
+            outputs=u_b.sum(),  # 求和为标量，简化梯度计算
+            inputs=coords_b,
+            create_graph=True,
+            retain_graph=True,
+            allow_unused=True
+        )[0]
+
+        if grad_u is None:
+            continue
+
+        du_dx_b = grad_u[..., 0:1]
+        du_dy_b = grad_u[..., 1:2]
+
+        # 计算二阶偏导数 d²u/dx²
+        d2u_dx2_b = torch.autograd.grad(
+            outputs=du_dx_b.sum(),
+            inputs=coords_b,
+            create_graph=True,
+            retain_graph=True,
+            allow_unused=True
+        )[0]
+
+        # 计算二阶偏导数 d²u/dy²
+        d2u_dy2_b = torch.autograd.grad(
+            outputs=du_dy_b.sum(),
+            inputs=coords_b,
+            create_graph=True,
+            retain_graph=True,
+            allow_unused=True
+        )[0]
+
+        if d2u_dx2_b is not None and d2u_dy2_b is not None:
+            laplacian_u_b = d2u_dx2_b[..., 0:1] + d2u_dy2_b[..., 1:2]
+            laplacian_u[b:b + 1, :, :] = laplacian_u_b
+
+    # 二维源项
+    x_coords = spatial_coords[..., 0:1]
+    y_coords = spatial_coords[..., 1:2]
+    source_term = 0.1 * torch.sin(torch.pi * x_coords) * torch.cos(torch.pi * y_coords)
+
+    # 泊松方程残差
+    physics_residual = laplacian_u + source_term
+    physics_loss = torch.mean(physics_residual ** 2)
+
+    return physics_loss
+
+
+def physics_informed_loss(model, cooling_batch, params_batch, physics_true_batch,
+                          lambda_physics=1.0, lambda_boundary=0.1, is_training=True):
+    """二维PINN损失函数"""
+    # Forward pass
+    physics_pred, spatial_coords = model(cooling_batch, params_batch, requires_grad=is_training)
+
+    # 展平用于损失计算
+    physics_true_flat = physics_true_batch.reshape(
+        physics_true_batch.shape[0], model.num_spatial_points, 3
+    )
+    physics_pred_flat = physics_pred.reshape(
+        physics_pred.shape[0], model.num_spatial_points, 3
+    )
+
+    # 1. 数据损失
+    data_loss = torch.mean((physics_pred_flat - physics_true_flat) ** 2)
+
+    # 2. 物理损失
+    physics_loss = torch.tensor(0.0, device=device)
+    if is_training and spatial_coords.requires_grad:
+        u = physics_pred_flat[:, :, 1:2].clone().detach().requires_grad_(True)
+        physics_loss = compute_physics_loss_2d(u, spatial_coords)
+
+    # 3. 边界损失
+    T_pred = physics_pred[:, :, :, 0]
+    T_top = T_pred[:, 0, :]
+    T_bottom = T_pred[:, -1, :]
+    T_left = T_pred[:, :, 0]
+    T_right = T_pred[:, :, -1]
+
+    T_bound_target = torch.tensor([0.8, 0.6, 0.7, 0.5], device=device)  # 需修改，假设真实值
+    boundary_loss = torch.mean(
+        (T_top - T_bound_target[0]) ** 2 +
+        (T_bottom - T_bound_target[1]) ** 2 +
+        (T_left - T_bound_target[2]) ** 2 +
+        (T_right - T_bound_target[3]) ** 2
+    )
+
+    # 总损失
+    total_loss = data_loss + lambda_physics * physics_loss + lambda_boundary * boundary_loss
+
+    return total_loss, data_loss, physics_loss, boundary_loss
+
+
+def setup_data_loaders_2d(cooling_params, model_params, physics_fields, batch_size=32):
+    """创建数据加载器 """
+    train_size = int(0.8 * len(cooling_params))
+    val_size = int(0.1 * len(cooling_params))
+
+    # 划分数据集
+    train_cooling = cooling_params[:train_size]
+    train_params = model_params[:train_size]
+    train_physics = physics_fields[:train_size]
+
+    val_cooling = cooling_params[train_size:train_size + val_size]
+    val_params = model_params[train_size:train_size + val_size]
+    val_physics = physics_fields[train_size:train_size + val_size]
+
+    test_cooling = cooling_params[train_size + val_size:]
+    test_params = model_params[train_size + val_size:]
+    test_physics = physics_fields[train_size + val_size:]
+
+    # 创建Dataset
+    train_dataset = TensorDataset(
+        torch.tensor(train_cooling, dtype=torch.float32),
+        torch.tensor(train_params, dtype=torch.float32),
+        torch.tensor(train_physics, dtype=torch.float32)
+    )
+
+    val_dataset = TensorDataset(
+        torch.tensor(val_cooling, dtype=torch.float32),
+        torch.tensor(val_params, dtype=torch.float32),
+        torch.tensor(val_physics, dtype=torch.float32)
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    return train_loader, val_loader, (test_cooling, test_params, test_physics)
+
+
+# 设置数据加载器
+print("\n=== 2D TRAINING SETUP ===")
+train_loader, val_loader, test_data = setup_data_loaders_2d(
+    cooling_params, model_params, physics_fields, batch_size=32
+)
+
+print(f"Training samples: {len(train_loader.dataset)}")
+print(f"Validation samples: {len(val_loader.dataset)}")
+print(f"Test samples: {len(test_data[0])}")
+print(f"Training batches: {len(train_loader)}")
+
+
+def train_physics_informed_model_2d(model, train_loader, val_loader,
+                                    num_epochs=1000, lr=0.001,
+                                    lambda_physics=1.0, lambda_boundary=0.1):
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+
+    train_losses = {'total': [], 'data': [], 'physics': [], 'boundary': []}
+    val_losses = {'total': [], 'data': [], 'physics': [], 'boundary': []}
+
+    best_val_loss = float('inf')
+    patience = 20
+    patience_counter = 0
+
+    pbar = tqdm(range(num_epochs), desc="Training 2D LSTM-MLP-PINN")
+
+    for epoch in pbar:
+        # 训练阶段
+        model.train()
+        train_loss_epoch = {'total': 0, 'data': 0, 'physics': 0, 'boundary': 0}
+
+        for cooling_batch, params_batch, physics_batch in train_loader:
+            cooling_batch = cooling_batch.to(device)
+            params_batch = params_batch.to(device)
+            physics_batch = physics_batch.to(device)
+
+            optimizer.zero_grad()
+            total_loss, data_loss, physics_loss, boundary_loss = physics_informed_loss(
+                model, cooling_batch, params_batch, physics_batch,
+                lambda_physics=lambda_physics, lambda_boundary=lambda_boundary,
+                is_training=True
+            )
+
+            total_loss.backward()
+            optimizer.step()
+
+            train_loss_epoch['total'] += total_loss.item()
+            train_loss_epoch['data'] += data_loss.item()
+            train_loss_epoch['physics'] += physics_loss.item()
+            train_loss_epoch['boundary'] += boundary_loss.item()
+
+        # 验证阶段
+        model.eval()
+        val_loss_epoch = {'total': 0, 'data': 0, 'physics': 0, 'boundary': 0}
+
+        with torch.no_grad():
+            for cooling_batch, params_batch, physics_batch in val_loader:
+                cooling_batch = cooling_batch.to(device)
+                params_batch = params_batch.to(device)
+                physics_batch = physics_batch.to(device)
+
+                total_loss, data_loss, physics_loss, boundary_loss = physics_informed_loss(
+                    model, cooling_batch, params_batch, physics_batch,
+                    lambda_physics=lambda_physics, lambda_boundary=lambda_boundary,
+                    is_training=False
+                )
+
+                val_loss_epoch['total'] += total_loss.item()
+                val_loss_epoch['data'] += data_loss.item()
+                val_loss_epoch['physics'] += physics_loss.item()
+                val_loss_epoch['boundary'] += boundary_loss.item()
+
+        # 平均损失
+        for key in train_loss_epoch:
+            train_loss_epoch[key] /= len(train_loader)
+            val_loss_epoch[key] /= len(val_loader)
+            train_losses[key].append(train_loss_epoch[key])
+            val_losses[key].append(val_loss_epoch[key])
+
+        scheduler.step(val_loss_epoch['total'])
+
+        # 更新进度条
+        pbar.set_postfix({
+            'Total': f'{train_loss_epoch["total"]:.2e}',
+            'Data': f'{train_loss_epoch["data"]:.2e}',
+            'Physics': f'{train_loss_epoch["physics"]:.2e}',
+            'Boundary': f'{train_loss_epoch["boundary"]:.2e}',
+            'LR': f'{optimizer.param_groups[0]["lr"]:.2e}'
+        })
+
+        # 早停机制
+        if val_loss_epoch['total'] < best_val_loss:
+            best_val_loss = val_loss_epoch['total']
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f'\nEarly stopping at epoch {epoch}')
+                break
+
+    pbar.close()
+    return train_losses, val_losses
+
+
+# 开始训练二维模型
+print("\nStarting 2D physics-informed training...")
+train_losses, val_losses = train_physics_informed_model_2d(
+    model, train_loader, val_loader,
+    num_epochs=1000, lr=0.001,
+    lambda_physics=1.0, lambda_boundary=0.1
+)
+
+# 打印训练结果
+print("\nTraining completed!")
+print(f"Final training losses:")
+print(f"  Total: {train_losses['total'][-1]:.2e}")
+print(f"  Data: {train_losses['data'][-1]:.2e}")
+print(f"  Physics: {train_losses['physics'][-1]:.2e}")
+print(f"  Boundary: {train_losses['boundary'][-1]:.2e}")
+
+
+def plot_loss_curves(train_losses, val_losses, figsize=(16, 12)):
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    loss_keys = ['total', 'data', 'physics', 'boundary']
+    titles = ['Total Loss (2D)', 'Data Loss (2D)', 'Physics Loss (2D Poisson PDE)', 'Boundary Loss (2D)']
+
+    for idx, (key, title) in enumerate(zip(loss_keys, titles)):
+        ax = axes[idx // 2, idx % 2]
+        # 绘制训练和验证损失，加粗线条
+        ax.plot(train_losses[key], label='Training', linewidth=3, alpha=0.9, color='#1f77b4')
+        ax.plot(val_losses[key], label='Validation', linewidth=3, alpha=0.9, color='#ff7f0e')
+        ax.set_title(title, fontsize=14)
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Loss', fontsize=12)
+        ax.set_yscale('log')
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        # 设置y轴范围，避免数值过小被压缩
+        min_loss = min(min(train_losses[key]), min(val_losses[key]))
+        max_loss = max(max(train_losses[key]), max(val_losses[key]))
+        ax.set_ylim(min_loss * 0.5, max_loss * 2)
+
+    plt.tight_layout()
+    plt.show()
+
+plot_loss_curves(train_losses, val_losses)
+
+
+def evaluate_model_2d(model, test_data):
+    """评估二维模型性能"""
+    test_cooling, test_params, test_physics = test_data
+    model.eval()
+
+    test_cooling_tensor = torch.tensor(test_cooling, dtype=torch.float32).to(device)
+    test_params_tensor = torch.tensor(test_params, dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        physics_pred, _ = model(test_cooling_tensor, test_params_tensor, requires_grad=False)
+        physics_pred = physics_pred.cpu().numpy()
+
+    # 计算MSE
+    test_physics_flat = test_physics.reshape(test_physics.shape[0], -1, 3)
+    physics_pred_flat = physics_pred.reshape(physics_pred.shape[0], -1, 3)
+
+    errors_T = np.mean((physics_pred_flat[:, :, 0] - test_physics_flat[:, :, 0]) ** 2, axis=1)
+    errors_V = np.mean((physics_pred_flat[:, :, 1] - test_physics_flat[:, :, 1]) ** 2, axis=1)
+    errors_P = np.mean((physics_pred_flat[:, :, 2] - test_physics_flat[:, :, 2]) ** 2, axis=1)
+
+    avg_error_T = np.mean(errors_T)
+    avg_error_V = np.mean(errors_V)
+    avg_error_P = np.mean(errors_P)
+
+    print(f"\n=== 2D MODEL EVALUATION ===")
+    print(f"Evaluation Results on Test Set:")
+    print(f"  Average MSE - Temperature: {avg_error_T:.6f}")
+    print(f"  Average MSE - Velocity: {avg_error_V:.6f}")
+    print(f"  Average MSE - Pressure: {avg_error_P:.6f}")
+    print(f"  Overall Average MSE: {(avg_error_T + avg_error_V + avg_error_P) / 3:.6f}")
+
+    return physics_pred, errors_T, errors_V, errors_P
+
+
+# 模型评估
+physics_pred, errors_T, errors_V, errors_P = evaluate_model_2d(model, test_data)
+
+
+print("\n=== PLOTTING 3D COMPARISON FOR PREDICTIONS ===")
+plot_3d_comparison_two_samples(X, Y, test_data[2], physics_pred, sample_indices=[0, 1])
+
+# 误差分布可视化
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+# 温度误差
+axes[0].hist(errors_T, bins=20, alpha=0.7, edgecolor='black', color='red')
+axes[0].axvline(np.mean(errors_T), color='black', linestyle='--',
+                label=f'Mean: {np.mean(errors_T):.4f}')
+axes[0].set_title('2D Temperature Error Distribution')
+axes[0].set_xlabel('MSE')
+axes[0].set_ylabel('Frequency')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+# 速度误差
+axes[1].hist(errors_V, bins=20, alpha=0.7, edgecolor='black', color='green')
+axes[1].axvline(np.mean(errors_V), color='black', linestyle='--',
+                label=f'Mean: {np.mean(errors_V):.4f}')
+axes[1].set_title('2D Velocity Error Distribution')
+axes[1].set_xlabel('MSE')
+axes[1].set_ylabel('Frequency')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+# 压力误差
+axes[2].hist(errors_P, bins=20, alpha=0.7, edgecolor='black', color='blue')
+axes[2].axvline(np.mean(errors_P), color='black', linestyle='--',
+                label=f'Mean: {np.mean(errors_P):.4f}')
+axes[2].set_title('2D Pressure Error Distribution')
+axes[2].set_xlabel('MSE')
+axes[2].set_ylabel('Frequency')
+axes[2].legend()
+axes[2].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
