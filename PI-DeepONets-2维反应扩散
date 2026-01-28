@@ -1,0 +1,1269 @@
+import h5py
+import numpy as np
+import warnings
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+from torch.utils.data import DataLoader, TensorDataset
+import os
+import json
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import matplotlib.animation as animation
+import matplotlib.pyplot as plt
+
+
+plt.rcParams['mathtext.fontset'] = 'dejavusans'
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']  # 支持中文+上标+特殊符号
+plt.rcParams['axes.unicode_minus'] = False
+
+# ==================== 1. 基础配置 ====================
+# 设置随机种子
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+
+# 设备配置（自动选择GPU/CPU）
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用设备: {device}")
+
+# 创建保存目录
+os.makedirs('saved_figures', exist_ok=True)
+os.makedirs('models', exist_ok=True)
+
+TRUE_DU = 1e-3  # 激活剂扩散系数
+TRUE_DV = 5e-3  # 抑制剂扩散系数
+TRUE_K = 5e-3  # 反应项常数k
+
+
+# ==================== 2. 数据加载与预处理 ====================
+def load_2d_diffusion_data(h5_path, max_groups=100, use_first_n_groups=50):
+    """
+    加载2D扩散-反应方程HDF5数据集（包含u和v分量）
+    """
+    print("\n=== 加载2D扩散-反应数据集 ===")
+    print(f"数据路径: {h5_path}")
+    all_u_data = []
+    all_v_data = []
+
+    with h5py.File(h5_path, 'r') as f:
+        # 获取所有模拟组
+        group_names = [key for key in f.keys() if key.isdigit() and len(key) == 4]
+        group_names.sort()
+
+        # 限制加载数量
+        if max_groups > 0 and len(group_names) > max_groups:
+            group_names = group_names[:max_groups]
+        group_names = group_names[:use_first_n_groups]
+
+        print(f"找到{len(group_names)}个模拟组，加载前{use_first_n_groups}个...")
+
+        # 加载数据
+        for i, group_name in enumerate(tqdm(group_names, desc="加载数据")):
+            group = f[group_name]
+            uv_group = group['data'][:]  # [time_steps, x, y, 2] - 0:u(activator), 1:v(inhibitor)
+
+            all_u_data.append(uv_group[..., 0])  # 激活剂u
+            all_v_data.append(uv_group[..., 1])  # 抑制剂v
+
+            # 只获取一次坐标信息
+            if i == 0:
+                grid = group['grid']
+                t_data = grid['t'][:]
+                x_data = grid['x'][:]
+                y_data = grid['y'][:]
+
+    # 转换为numpy数组
+    u_data = np.array(all_u_data)  # [groups, time, x, y]
+    v_data = np.array(all_v_data)  # [groups, time, x, y]
+
+    print(f"\n数据加载完成:")
+    print(f"  u数据形状: {u_data.shape} (组 × 时间步 × X × Y)")
+    print(f"  v数据形状: {v_data.shape} (组 × 时间步 × X × Y)")
+    print(f"  时间范围: {t_data[0]:.2f} ~ {t_data[-1]:.2f}")
+    print(f"  X范围: {x_data.min():.4f} ~ {x_data.max():.4f}")
+    print(f"  Y范围: {y_data.min():.4f} ~ {y_data.max():.4f}")
+    print(f"  u值范围: {u_data.min():.4f} ~ {u_data.max():.4f}")
+    print(f"  v值范围: {v_data.min():.4f} ~ {v_data.max():.4f}")
+
+    return u_data, v_data, t_data, x_data, y_data
+
+
+def prepare_training_data(u_data, v_data, t_data, x_data, y_data,
+                          num_samples_per_group=20,
+                          num_points_per_sample=200,
+                          max_time_interval=10):
+    """
+    预处理训练数据，生成DeepONet输入格式（包含u和v的耦合）
+    """
+    print("\n=== 预处理训练数据 ===")
+    num_groups, time_steps, spatial_x, spatial_y = u_data.shape
+    total_spatial_points = spatial_x * spatial_y
+
+    # 创建空间网格
+    X, Y = np.meshgrid(x_data, y_data, indexing='ij')
+    x_flat = X.flatten()
+    y_flat = Y.flatten()
+
+    # 展平u和v数据
+    u_flat = u_data.reshape(num_groups, time_steps, total_spatial_points)
+    v_flat = v_data.reshape(num_groups, time_steps, total_spatial_points)
+
+    # 生成训练样本
+    uv0_list = []  # 初始条件 [samples, 2*spatial_x*spatial_y] - 前半部分u，后半部分v
+    trunk_list = []  # 时空坐标 [samples, num_points, 3] (Δt, x, y)
+    u_true_list = []  # u真实值 [samples, num_points]
+    v_true_list = []  # v真实值 [samples, num_points]
+
+    total_samples = num_groups * num_samples_per_group
+    print(f"生成{total_samples}个训练样本 (每组{num_samples_per_group}个)...")
+
+    pbar = tqdm(total=total_samples)
+    for group_idx in range(num_groups):
+        for _ in range(num_samples_per_group):
+            # 随机选择初始时间步和时间间隔
+            t0_idx = np.random.randint(0, time_steps - max_time_interval - 1)
+            dt_idx = np.random.randint(1, max_time_interval + 1)
+            t1_idx = t0_idx + dt_idx
+
+            # 初始条件（u和v拼接）和目标值
+            u0 = u_flat[group_idx, t0_idx, :]
+            v0 = v_flat[group_idx, t0_idx, :]
+            uv0 = np.concatenate([u0, v0], axis=0)
+
+            u1 = u_flat[group_idx, t1_idx, :]
+            v1 = v_flat[group_idx, t1_idx, :]
+            dt = t_data[t1_idx] - t_data[t0_idx]
+
+            # 随机采样空间点
+            spatial_indices = np.random.choice(total_spatial_points, num_points_per_sample, replace=True)
+
+            # 构建时空坐标
+            sample_t = np.full(num_points_per_sample, dt)
+            sample_x = x_flat[spatial_indices]
+            sample_y = y_flat[spatial_indices]
+            trunk_sample = np.stack([sample_t, sample_x, sample_y], axis=-1)
+
+            # 收集数据
+            uv0_list.append(uv0)
+            trunk_list.append(trunk_sample)
+            u_true_list.append(u1[spatial_indices])
+            v_true_list.append(v1[spatial_indices])
+
+            pbar.update(1)
+    pbar.close()
+
+    # 转换为numpy数组
+    uv0_array = np.array(uv0_list, dtype=np.float32)
+    trunk_array = np.array(trunk_list, dtype=np.float32)
+    u_true_array = np.array(u_true_list, dtype=np.float32)
+    v_true_array = np.array(v_true_list, dtype=np.float32)
+
+    print(f"数据预处理完成:")
+    print(f"  初始条件形状: {uv0_array.shape} (u + v)")
+    print(f"  时空坐标形状: {trunk_array.shape}")
+    print(f"  u真实值形状: {u_true_array.shape}")
+    print(f"  v真实值形状: {v_true_array.shape}")
+    print(f"  时间间隔范围: {np.min(trunk_array[:, 0, 0]):.3f} ~ {np.max(trunk_array[:, 0, 0]):.3f}")
+
+    return uv0_array, trunk_array, u_true_array, v_true_array, (x_data, y_data, t_data)
+
+
+# ==================== 3. 数据集可视化 ====================
+def visualize_dataset_samples(u_data, v_data, t_data, x_data, y_data, save_path='saved_figures/dataset_samples.png'):
+    """
+    可视化数据集样本（u和v在不同时间步的2D分布）
+    """
+    print("\n=== 可视化数据集样本 ===")
+    # 选择第0组数据
+    group_indices = [0, 10, 49]
+    time_indices = [0, 25, 50, 100]  # 选择4个时间步
+
+    # 创建子图 (3组 × 4时间步 × 2变量)
+    fig, axes = plt.subplots(3, 8, figsize=(32, 15),constrained_layout=True)
+
+    # 动态调整颜色范围
+    u_vals = []
+    v_vals = []
+    for g in group_indices:
+        for t in time_indices:
+            u_vals.append(u_data[g, t].flatten())
+            v_vals.append(v_data[g, t].flatten())
+
+    u_vals = np.concatenate(u_vals)
+    v_vals = np.concatenate(v_vals)
+    u_vmin, u_vmax = np.percentile(u_vals, [5, 95])
+    v_vmin, v_vmax = np.percentile(v_vals, [5, 95])
+
+    # 绘制可视化
+    for g_idx, group_idx in enumerate(group_indices):
+        for t_idx, time_step in enumerate(time_indices):
+            # 绘制u
+            ax_u = axes[g_idx, t_idx * 2]
+            im_u = ax_u.imshow(
+                u_data[group_idx, time_step],
+                cmap='RdBu_r',
+                vmin=u_vmin,
+                vmax=u_vmax,
+                extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()]
+            )
+            ax_u.set_title(f'Group {group_idx}, t={t_data[time_step]:.2f}\nu (activator)')
+            ax_u.set_xlabel('X')
+            ax_u.set_ylabel('Y')
+
+            # 绘制v
+            ax_v = axes[g_idx, t_idx * 2 + 1]
+            im_v = ax_v.imshow(
+                v_data[group_idx, time_step],
+                cmap='RdYlBu_r',
+                vmin=v_vmin,
+                vmax=v_vmax,
+                extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()]
+            )
+            ax_v.set_title(f'Group {group_idx}, t={t_data[time_step]:.2f}\nv (inhibitor)')
+            ax_v.set_xlabel('X')
+            ax_v.set_ylabel('Y')
+
+    # 添加颜色条
+    cbar_u = fig.colorbar(im_u, ax=axes[:, ::2], orientation='vertical', fraction=0.01, pad=0.02)
+    cbar_u.set_label('u (activator) value')
+
+    cbar_v = fig.colorbar(im_v, ax=axes[:, 1::2], orientation='vertical', fraction=0.01, pad=0.02)
+    cbar_v.set_label('v (inhibitor) value')
+
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"数据集样本可视化已保存至: {save_path}")
+
+
+def create_evolution_gif(u_data, v_data, t_data, x_data, y_data, group_idx=0, save_path='saved_figures/evolution.gif'):
+    """生成u和v的时空演化动画"""
+    print("\n=== 生成时空演化动画 ===")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+
+    # 颜色范围
+    u_vals = u_data[group_idx].flatten()
+    v_vals = v_data[group_idx].flatten()
+    u_vmin, u_vmax = np.percentile(u_vals, [5, 95])
+    v_vmin, v_vmax = np.percentile(v_vals, [5, 95])
+
+    # 初始化图像
+    im1 = ax1.imshow(u_data[group_idx, 0], cmap='RdBu_r', vmin=u_vmin, vmax=u_vmax,
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()])
+    im2 = ax2.imshow(v_data[group_idx, 0], cmap='RdYlBu_r', vmin=v_vmin, vmax=v_vmax,
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()])
+
+    title1 = ax1.set_title(f'Group {group_idx}, t={t_data[0]:.2f}\nu (activator)')
+    title2 = ax2.set_title(f'Group {group_idx}, t={t_data[0]:.2f}\nv (inhibitor)')
+
+    ax1.set_xlabel('X')
+    ax1.set_ylabel('Y')
+    ax2.set_xlabel('X')
+    ax2.set_ylabel('Y')
+
+    cbar1 = plt.colorbar(im1, ax=ax1)
+    cbar1.set_label('u value')
+    cbar2 = plt.colorbar(im2, ax=ax2)
+    cbar2.set_label('v value')
+
+    # 更新函数
+    def update(frame):
+        im1.set_data(u_data[group_idx, frame])
+        im2.set_data(v_data[group_idx, frame])
+        title1.set_text(f'Group {group_idx}, t={t_data[frame]:.2f}\nu (activator)')
+        title2.set_text(f'Group {group_idx}, t={t_data[frame]:.2f}\nv (inhibitor)')
+        return im1, im2, title1, title2
+
+    # 生成动画
+    ani = animation.FuncAnimation(
+        fig, update, frames=range(0, 101, 5),
+        interval=200, blit=True
+    )
+    ani.save(save_path, writer='pillow', dpi=150)
+    plt.close()
+    print(f"演化动画已保存至: {save_path}")
+
+
+# ==================== 4. DeepONet模型定义 ====================
+class FitzHughNagumoDeepONet(nn.Module):
+    """
+    PI-DeepONet for 2D FitzHugh-Nagumo Diffusion-Reaction Equation
+    同时预测u和v，严格匹配论文中的方程
+    """
+
+    def __init__(self, branch_input_dim, trunk_input_dim, hidden_dim=64, num_basis=32):
+        super().__init__()
+        self.num_basis = num_basis
+        self.hidden_dim = hidden_dim
+
+        # Branch网络：处理u和v的初始条件
+        self.branch_net = nn.Sequential(
+            nn.Linear(branch_input_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 2 * num_basis)  # ×2因为要同时预测u和v
+        )
+
+        # Trunk网络：处理时空坐标
+        self.trunk_net = nn.Sequential(
+            nn.Linear(trunk_input_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 2 * num_basis)
+        )
+
+        # 偏置项（u和v各一个）
+        self.bias_u = nn.Parameter(torch.zeros(1))
+        self.bias_v = nn.Parameter(torch.zeros(1))
+
+        # 物理参数（使用Softplus确保非负）
+        self.Du_raw = nn.Parameter(torch.tensor(TRUE_DU))  # 激活剂扩散系数
+        self.Dv_raw = nn.Parameter(torch.tensor(TRUE_DV))  # 抑制剂扩散系数
+        self.k_raw = nn.Parameter(torch.tensor(TRUE_K))  # 反应项常数k
+
+    @property
+    def Du(self):
+        """获取激活剂扩散系数（确保非负）"""
+        return torch.nn.functional.softplus(self.Du_raw, beta=10)
+
+    @property
+    def Dv(self):
+        """获取抑制剂扩散系数（确保非负）"""
+        return torch.nn.functional.softplus(self.Dv_raw, beta=10)
+
+    @property
+    def k(self):
+        """获取反应项常数k（确保非负）"""
+        return torch.nn.functional.softplus(self.k_raw, beta=10)
+
+    def forward(self, branch_input, trunk_input):
+        """
+        前向传播，同时预测u和v
+        branch_input: [batch_size, branch_input_dim] (u0 + v0)
+        trunk_input: [batch_size, num_points, trunk_input_dim]
+        return: u_pred [batch_size, num_points], v_pred [batch_size, num_points]
+        """
+        # Branch网络输出
+        branch_out = self.branch_net(branch_input)  # [batch, 2*num_basis]
+        branch_out_u = branch_out[:, :self.num_basis]  # u的基函数
+        branch_out_v = branch_out[:, self.num_basis:]  # v的基函数
+
+        # Trunk网络输出
+        batch_size, num_points, _ = trunk_input.shape
+        trunk_input_flat = trunk_input.reshape(-1, trunk_input_dim)
+        trunk_out_flat = self.trunk_net(trunk_input_flat)  # [batch*num_points, 2*num_basis]
+        trunk_out = trunk_out_flat.reshape(batch_size, num_points, -1)
+
+        trunk_out_u = trunk_out[:, :, :self.num_basis]  # u的基函数
+        trunk_out_v = trunk_out[:, :, self.num_basis:]  # v的基函数
+
+        # 内积计算 + 偏置
+        u_pred = torch.einsum('bi,bpi->bp', branch_out_u, trunk_out_u) + self.bias_u
+        v_pred = torch.einsum('bi,bpi->bp', branch_out_v, trunk_out_v) + self.bias_v
+
+        return u_pred, v_pred
+
+    def compute_derivatives(self, branch_input, trunk_input):
+        """
+        计算u和v的各阶导数（用于物理损失）
+        返回: u_pred, v_pred, 以及各阶导数
+        """
+        # 深拷贝并开启梯度
+        trunk_input_grad = torch.clone(trunk_input).detach().requires_grad_(True)
+
+        # 前向传播
+        u_pred, v_pred = self.forward(branch_input, trunk_input_grad)
+        batch_size, num_points = u_pred.shape
+
+        # 初始化导数
+        def init_deriv():
+            return torch.zeros(batch_size, num_points, 1, device=device, requires_grad=True)
+
+
+        du_dt = torch.zeros_like(u_pred).unsqueeze(-1).requires_grad_(True)
+        du_dx = torch.zeros_like(u_pred).unsqueeze(-1).requires_grad_(True)
+        du_dy = torch.zeros_like(u_pred).unsqueeze(-1).requires_grad_(True)
+        d2u_dx2 = torch.zeros_like(u_pred).unsqueeze(-1).requires_grad_(True)
+        d2u_dy2 = torch.zeros_like(u_pred).unsqueeze(-1).requires_grad_(True)
+
+        dv_dt = torch.zeros_like(v_pred).unsqueeze(-1).requires_grad_(True)
+        dv_dx = torch.zeros_like(v_pred).unsqueeze(-1).requires_grad_(True)
+        dv_dy = torch.zeros_like(v_pred).unsqueeze(-1).requires_grad_(True)
+        d2v_dx2 = torch.zeros_like(v_pred).unsqueeze(-1).requires_grad_(True)
+        d2v_dy2 = torch.zeros_like(v_pred).unsqueeze(-1).requires_grad_(True)
+
+        try:
+            # 计算u的一阶梯度
+            grad_u = torch.autograd.grad(
+                outputs=u_pred.sum(),
+                inputs=trunk_input_grad,
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0]
+
+            if grad_u is not None:
+                du_dt = grad_u[..., 0:1]
+                du_dx = grad_u[..., 1:2]
+                du_dy = grad_u[..., 2:3]
+
+                # u的二阶梯度
+                d2u_dx2 = torch.autograd.grad(
+                    outputs=du_dx.sum(),
+                    inputs=trunk_input_grad,
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][..., 1:2] if grad_u is not None else init_deriv()
+
+                d2u_dy2 = torch.autograd.grad(
+                    outputs=du_dy.sum(),
+                    inputs=trunk_input_grad,
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][..., 2:3] if grad_u is not None else init_deriv()
+
+            # 计算v的一阶梯度
+            grad_v = torch.autograd.grad(
+                outputs=v_pred.sum(),
+                inputs=trunk_input_grad,
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0]
+
+            if grad_v is not None:
+                dv_dt = grad_v[..., 0:1]
+                dv_dx = grad_v[..., 1:2]
+                dv_dy = grad_v[..., 2:3]
+
+                # v的二阶梯度
+                d2v_dx2 = torch.autograd.grad(
+                    outputs=dv_dx.sum(),
+                    inputs=trunk_input_grad,
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][..., 1:2] if grad_v is not None else init_deriv()
+
+                d2v_dy2 = torch.autograd.grad(
+                    outputs=dv_dy.sum(),
+                    inputs=trunk_input_grad,
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][..., 2:3] if grad_v is not None else init_deriv()
+
+        except Exception as e:
+            # 只打印严重错误，忽略梯度警告
+            if "RuntimeError" in str(e):
+                print(f"梯度计算错误: {e}")
+
+
+        return (u_pred, v_pred,
+                du_dt, du_dx, du_dy, d2u_dx2, d2u_dy2,
+                dv_dt, dv_dx, dv_dy, d2v_dx2, d2v_dy2)
+
+
+# ==================== 5. 损失函数 ====================
+def fitzhugh_nagumo_loss(model, uv0_input, trunk_input, u_true, v_true,
+                         lambda_physics=1.0, lambda_boundary=5.0, lambda_params=2.0):
+    """
+    FitzHugh-Nagumo方程的混合损失函数
+    严格按照论文公式：
+    ∂t u = Du(∂xx u + ∂yy u) + u - u³ - k - v
+    ∂t v = Dv(∂xx v + ∂yy v) + u - v
+    """
+    # 计算预测值和导数
+    (u_pred, v_pred,
+     du_dt, du_dx, du_dy, d2u_dx2, d2u_dy2,
+     dv_dt, dv_dx, dv_dy, d2v_dx2, d2v_dy2) = model.compute_derivatives(uv0_input, trunk_input)
+
+    # 1. 数据损失（MSE）
+    u_data_loss = torch.mean((u_pred - u_true) ** 2)
+    v_data_loss = torch.mean((v_pred - v_true) ** 2)
+    data_loss = (u_data_loss + v_data_loss) / 2
+
+    # 2. 物理损失（FitzHugh-Nagumo方程残差）
+    # u的方程残差
+    u_diffusion = model.Du * (d2u_dx2 + d2u_dy2)
+    u_reaction = u_pred.unsqueeze(-1) - u_pred.unsqueeze(-1) ** 3 - model.k - v_pred.unsqueeze(-1)
+    u_physics_residual = du_dt - (u_diffusion + u_reaction)
+
+    # v的方程残差
+    v_diffusion = model.Dv * (d2v_dx2 + d2v_dy2)
+    v_reaction = u_pred.unsqueeze(-1) - v_pred.unsqueeze(-1)
+    v_physics_residual = dv_dt - (v_diffusion + v_reaction)
+
+    physics_loss = (torch.mean(u_physics_residual ** 2) + torch.mean(v_physics_residual ** 2)) / 2
+
+    # 3. 边界损失（Neumann边界条件：∂u/∂n = 0, ∂v/∂n = 0）
+    x_coords = trunk_input[..., 1]
+    y_coords = trunk_input[..., 2]
+    eps = 0.05
+    boundary_mask = ((torch.abs(x_coords + 1.0) < eps) |
+                     (torch.abs(x_coords - 1.0) < eps) |
+                     (torch.abs(y_coords + 1.0) < eps) |
+                     (torch.abs(y_coords - 1.0) < eps))
+
+    boundary_loss = torch.tensor(0.0, device=device)
+    if torch.any(boundary_mask):
+        # u的边界损失
+        du_dx_boundary = du_dx[boundary_mask.unsqueeze(-1)].reshape(-1)
+        du_dy_boundary = du_dy[boundary_mask.unsqueeze(-1)].reshape(-1)
+
+        # v的边界损失
+        dv_dx_boundary = dv_dx[boundary_mask.unsqueeze(-1)].reshape(-1)
+        dv_dy_boundary = dv_dy[boundary_mask.unsqueeze(-1)].reshape(-1)
+
+        boundary_loss = (torch.mean(du_dx_boundary ** 2) + torch.mean(du_dy_boundary ** 2) +
+                         torch.mean(dv_dx_boundary ** 2) + torch.mean(dv_dy_boundary ** 2)) / 4
+
+    # 4. 参数正则化损失（向论文中的真实值靠近）
+    param_loss = (torch.mean((model.Du - TRUE_DU) ** 2) +
+                  torch.mean((model.Dv - TRUE_DV) ** 2) +
+                  torch.mean((model.k - TRUE_K) ** 2)) * lambda_params
+
+    # 总损失
+    total_loss = data_loss + lambda_physics * physics_loss + lambda_boundary * boundary_loss + param_loss
+
+    return (total_loss, data_loss, physics_loss, boundary_loss, param_loss,
+            u_data_loss, v_data_loss, u_physics_residual.mean(), v_physics_residual.mean())
+
+
+# ==================== 6. 数据加载器 ====================
+def create_data_loaders(uv0_array, trunk_array, u_true_array, v_true_array,
+                        batch_size=32, val_split=0.15, test_split=0.15):
+    """
+    创建训练/验证/测试数据加载器（包含u和v）
+    """
+    print("\n=== 创建数据加载器 ===")
+    total_samples = len(uv0_array)
+
+    # 划分数据集
+    test_size = int(total_samples * test_split)
+    val_size = int(total_samples * val_split)
+    train_size = total_samples - val_size - test_size
+
+    # 随机打乱
+    indices = np.random.permutation(total_samples)
+    train_idx = indices[:train_size]
+    val_idx = indices[train_size:train_size + val_size]
+    test_idx = indices[train_size + val_size:]
+
+    # 创建数据集
+    train_dataset = TensorDataset(
+        torch.tensor(uv0_array[train_idx]),
+        torch.tensor(trunk_array[train_idx]),
+        torch.tensor(u_true_array[train_idx]),
+        torch.tensor(v_true_array[train_idx])
+    )
+
+    val_dataset = TensorDataset(
+        torch.tensor(uv0_array[val_idx]),
+        torch.tensor(trunk_array[val_idx]),
+        torch.tensor(u_true_array[val_idx]),
+        torch.tensor(v_true_array[val_idx])
+    )
+
+    test_dataset = TensorDataset(
+        torch.tensor(uv0_array[test_idx]),
+        torch.tensor(trunk_array[test_idx]),
+        torch.tensor(u_true_array[test_idx]),
+        torch.tensor(v_true_array[test_idx])
+    )
+
+    # 创建数据加载器
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    print(f"数据集划分:")
+    print(f"  训练集: {train_size} samples")
+    print(f"  验证集: {val_size} samples")
+    print(f"  测试集: {test_size} samples")
+    print(f"  批次大小: {batch_size}")
+
+    return train_loader, val_loader, test_loader, (train_idx, val_idx, test_idx)
+
+
+# ==================== 7. 模型训练 ====================
+def train_model(model, train_loader, val_loader, num_epochs=1000, lr=0.0005, weight_decay=1e-5):
+    """
+    训练模型 - 适配FitzHugh-Nagumo方程
+    """
+    print("\n=== 开始训练模型 ===")
+    print(f"训练轮数: {num_epochs}")
+    print(f"学习率: {lr}")
+    print(f"权重衰减: {weight_decay}")
+    print(f"物理参数真实值: Du={TRUE_DU}, Dv={TRUE_DV}, k={TRUE_K}")
+
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # 学习率调度器：预热 + 余弦退火
+    def lr_lambda(epoch):
+        warmup_epochs = 20
+        if epoch < warmup_epochs:
+            return epoch / warmup_epochs
+        else:
+            return 0.5 * (1 + np.cos(np.pi * (epoch - warmup_epochs) / (num_epochs - warmup_epochs)))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    # 记录训练日志
+    train_log = {
+        'total_loss': [], 'data_loss': [], 'physics_loss': [], 'boundary_loss': [], 'params_loss': [],
+        'u_data_loss': [], 'v_data_loss': [], 'u_physics_loss': [], 'v_physics_loss': [],
+        'lr': []
+    }
+    val_log = {
+        'total_loss': [], 'data_loss': [], 'physics_loss': [], 'boundary_loss': [], 'params_loss': [],
+        'u_data_loss': [], 'v_data_loss': [], 'u_physics_loss': [], 'v_physics_loss': []
+    }
+    param_log = {
+        'Du': [], 'Dv': [], 'k': []
+    }
+
+    # 最佳模型记录
+    best_val_loss = float('inf')
+    best_epoch = 0
+
+    # 训练循环
+    pbar = tqdm(range(num_epochs), desc="训练进度")
+    for epoch in pbar:
+        # 训练阶段
+        model.train()
+        train_losses = {
+            'total': 0, 'data': 0, 'physics': 0, 'boundary': 0, 'params': 0,
+            'u_data': 0, 'v_data': 0, 'u_physics': 0, 'v_physics': 0
+        }
+        train_steps = 0
+
+        for batch in train_loader:
+            uv0_batch, trunk_batch, u_true_batch, v_true_batch = [x.to(device) for x in batch]
+
+            optimizer.zero_grad()
+
+            # 计算损失
+            losses = fitzhugh_nagumo_loss(model, uv0_batch, trunk_batch, u_true_batch, v_true_batch)
+            (total_loss, data_loss, physics_loss, boundary_loss, params_loss,
+             u_data_loss, v_data_loss, u_physics, v_physics) = losses
+
+            # 反向传播
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+
+            # 累加损失
+            train_losses['total'] += total_loss.item()
+            train_losses['data'] += data_loss.item()
+            train_losses['physics'] += physics_loss.item()
+            train_losses['boundary'] += boundary_loss.item()
+            train_losses['params'] += params_loss.item()
+            train_losses['u_data'] += u_data_loss.item()
+            train_losses['v_data'] += v_data_loss.item()
+            train_losses['u_physics'] += u_physics.item()
+            train_losses['v_physics'] += v_physics.item()
+            train_steps += 1
+
+        # 计算平均训练损失
+        for key in train_losses:
+            train_losses[key] /= train_steps
+
+        # 更新日志
+        for key in ['total', 'data', 'physics', 'boundary', 'params']:
+            train_log[f'{key}_loss'].append(train_losses[key])
+        train_log['u_data_loss'].append(train_losses['u_data'])
+        train_log['v_data_loss'].append(train_losses['v_data'])
+        train_log['u_physics_loss'].append(train_losses['u_physics'])
+        train_log['v_physics_loss'].append(train_losses['v_physics'])
+        train_log['lr'].append(optimizer.param_groups[0]['lr'])
+
+        # 验证阶段
+        model.eval()
+        val_losses = {
+            'total': 0, 'data': 0, 'physics': 0, 'boundary': 0, 'params': 0,
+            'u_data': 0, 'v_data': 0, 'u_physics': 0, 'v_physics': 0
+        }
+        val_steps = 0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                uv0_batch, trunk_batch, u_true_batch, v_true_batch = [x.to(device) for x in batch]
+                losses = fitzhugh_nagumo_loss(model, uv0_batch, trunk_batch, u_true_batch, v_true_batch)
+
+                val_losses['total'] += losses[0].item()
+                val_losses['data'] += losses[1].item()
+                val_losses['physics'] += losses[2].item()
+                val_losses['boundary'] += losses[3].item()
+                val_losses['params'] += losses[4].item()
+                val_losses['u_data'] += losses[5].item()
+                val_losses['v_data'] += losses[6].item()
+                val_losses['u_physics'] += losses[7].item()
+                val_losses['v_physics'] += losses[8].item()
+                val_steps += 1
+
+        # 计算平均验证损失
+        for key in val_losses:
+            val_losses[key] /= val_steps
+
+        # 更新日志
+        for key in ['total', 'data', 'physics', 'boundary', 'params']:
+            val_log[f'{key}_loss'].append(val_losses[key])
+        val_log['u_data_loss'].append(val_losses['u_data'])
+        val_log['v_data_loss'].append(val_losses['v_data'])
+        val_log['u_physics_loss'].append(val_losses['u_physics'])
+        val_log['v_physics_loss'].append(val_losses['v_physics'])
+
+        # 记录物理参数
+        param_log['Du'].append(model.Du.item())
+        param_log['Dv'].append(model.Dv.item())
+        param_log['k'].append(model.k.item())
+
+        # 更新学习率
+        scheduler.step()
+
+        # 保存最佳模型
+        if val_losses['total'] < best_val_loss:
+            best_val_loss = val_losses['total']
+            best_epoch = epoch
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+                'train_log': train_log,
+                'val_log': val_log,
+                'param_log': param_log
+            }, 'models/best_model.pth')
+
+        # 更新进度条
+        pbar.set_postfix({
+            'Train': f'{train_losses["total"]:.2e}',
+            'Val': f'{val_losses["total"]:.2e}',
+            'Phys': f'{train_losses["physics"]:.2e}',
+            'Du': f'{model.Du.item():.4f}',
+            'Dv': f'{model.Dv.item():.4f}',
+            'k': f'{model.k.item():.4f}',
+            'LR': f'{optimizer.param_groups[0]["lr"]:.2e}'
+        })
+
+    pbar.close()
+
+    # 加载最佳模型
+    checkpoint = torch.load('models/best_model.pth', weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    print(f"\n训练完成!")
+    print(f"最佳验证损失: {best_val_loss:.6f} (Epoch {best_epoch})")
+    print(f"最终Du: {model.Du.item():.6f} (真实值: {TRUE_DU:.6f})")
+    print(f"最终Dv: {model.Dv.item():.6f} (真实值: {TRUE_DV:.6f})")
+    print(f"最终k: {model.k.item():.6f} (真实值: {TRUE_K:.6f})")
+
+    # 保存训练日志
+    log_data = {
+        'train_log': train_log,
+        'val_log': val_log,
+        'param_log': param_log,
+        'best_val_loss': best_val_loss,
+        'best_epoch': best_epoch,
+        'true_params': {'Du': TRUE_DU, 'Dv': TRUE_DV, 'k': TRUE_K},
+        'final_params': {'Du': model.Du.item(), 'Dv': model.Dv.item(), 'k': model.k.item()}
+    }
+
+    with open('models/training_log.json', 'w') as f:
+        json.dump(log_data, f, indent=4)
+
+    return model, log_data
+
+
+# ==================== 8. 训练结果可视化 ====================
+def visualize_training_results(log_data, save_dir='saved_figures'):
+    """
+    可视化训练结果（包含u和v的损失，以及三个物理参数）
+    """
+    print("\n=== 可视化训练结果 ===")
+    train_log = log_data['train_log']
+    val_log = log_data['val_log']
+    param_log = log_data['param_log']
+    true_params = log_data['true_params']
+    epochs = range(1, len(train_log['total_loss']) + 1)
+
+    # 创建子图
+    plt.figure(figsize=(20, 16))
+
+    # 1. 总损失曲线
+    plt.subplot(3, 3, 1)
+    plt.plot(epochs, train_log['total_loss'], label='训练集', color='blue', linewidth=1.5)
+    plt.plot(epochs, val_log['total_loss'], label='验证集', color='red', linewidth=1.5)
+    plt.xlabel('Epoch')
+    plt.ylabel('Total Loss')
+    plt.title('总损失曲线')
+    plt.yscale('log')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 2. u和v的数据损失
+    plt.subplot(3, 3, 2)
+    plt.plot(epochs, train_log['u_data_loss'], label='u 数据损失', color='green', linewidth=1.5)
+    plt.plot(epochs, train_log['v_data_loss'], label='v 数据损失', color='orange', linewidth=1.5)
+    plt.xlabel('Epoch')
+    plt.ylabel('Data Loss')
+    plt.title('u和v的数据损失')
+    plt.yscale('log')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 3. 物理损失
+    plt.subplot(3, 3, 3)
+    plt.plot(epochs, train_log['physics_loss'], label='训练集', color='purple', linewidth=1.5)
+    plt.plot(epochs, val_log['physics_loss'], label='验证集', color='brown', linewidth=1.5)
+    plt.xlabel('Epoch')
+    plt.ylabel('Physics Loss')
+    plt.title('物理损失收敛曲线')
+    plt.yscale('log')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 4. 扩散系数Du
+    plt.subplot(3, 3, 4)
+    plt.plot(epochs, param_log['Du'], label='预测值', color='green', linewidth=1.5)
+    plt.axhline(y=true_params['Du'], color='green', linestyle='--', alpha=0.7, label=f'真实值 {true_params["Du"]}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Du')
+    plt.title('扩散系数Du收敛曲线')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 5. 扩散系数Dv
+    plt.subplot(3, 3, 5)
+    plt.plot(epochs, param_log['Dv'], label='预测值', color='orange', linewidth=1.5)
+    plt.axhline(y=true_params['Dv'], color='orange', linestyle='--', alpha=0.7, label=f'真实值 {true_params["Dv"]}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Dv')
+    plt.title('扩散系数Dv收敛曲线')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 6. 反应常数k
+    plt.subplot(3, 3, 6)
+    plt.plot(epochs, param_log['k'], label='预测值', color='red', linewidth=1.5)
+    plt.axhline(y=true_params['k'], color='red', linestyle='--', alpha=0.7, label=f'真实值 {true_params["k"]}')
+    plt.xlabel('Epoch')
+    plt.ylabel('k')
+    plt.title('反应常数k收敛曲线')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 7. 各损失分量对比
+    plt.subplot(3, 3, 7)
+    plt.plot(epochs, train_log['data_loss'], label='数据损失', linewidth=1.5)
+    plt.plot(epochs, train_log['physics_loss'], label='物理损失', linewidth=1.5)
+    plt.plot(epochs, train_log['boundary_loss'], label='边界损失', linewidth=1.5)
+    plt.plot(epochs, train_log['params_loss'], label='参数损失', linewidth=1.5)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('各损失分量对比')
+    plt.yscale('log')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 8. u和v的物理损失
+    plt.subplot(3, 3, 8)
+    plt.plot(epochs, train_log['u_physics_loss'], label='u 物理损失', color='green', linewidth=1.5)
+    plt.plot(epochs, train_log['v_physics_loss'], label='v 物理损失', color='orange', linewidth=1.5)
+    plt.xlabel('Epoch')
+    plt.ylabel('Physics Loss')
+    plt.title('u和v的物理损失')
+    plt.yscale('log')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 9. 学习率变化
+    plt.subplot(3, 3, 9)
+    plt.plot(epochs, train_log['lr'], color='purple', linewidth=1.5)
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.title('学习率变化曲线')
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/training_loss_curves.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"训练损失曲线已保存至: {save_dir}/training_loss_curves.png")
+
+# ==================== 9. 模型评估与预测可视化 ====================
+def evaluate_model(model, test_loader, save_dir='saved_figures'):
+    """
+    评估模型性能（同时评估u和v的预测效果）- 修复梯度相关错误
+    """
+    print("\n=== 评估模型性能 ===")
+    model.eval()
+
+    # 收集预测值和真实值
+    all_u_preds = []
+    all_u_trues = []
+    all_v_preds = []
+    all_v_trues = []
+    physics_losses = []
+
+    with torch.no_grad():  # 关键：禁用梯度计算
+        for batch in test_loader:
+            uv0_batch, trunk_batch, u_true_batch, v_true_batch = [x.to(device, non_blocking=True) for x in batch]
+
+            # 前向传播获取预测值
+            u_pred, v_pred = model(uv0_batch, trunk_batch)
+
+            # 计算物理损失
+            losses = fitzhugh_nagumo_loss(model, uv0_batch, trunk_batch, u_true_batch, v_true_batch)
+            physics_losses.append(losses[2].item())  # physics_loss
+
+            # 正确分离梯度并转换为numpy
+            all_u_preds.extend(u_pred.detach().cpu().numpy().flatten())
+            all_u_trues.extend(u_true_batch.detach().cpu().numpy().flatten())
+            all_v_preds.extend(v_pred.detach().cpu().numpy().flatten())
+            all_v_trues.extend(v_true_batch.detach().cpu().numpy().flatten())
+
+    # 转换为numpy数组
+    all_u_preds = np.array(all_u_preds)
+    all_u_trues = np.array(all_u_trues)
+    all_v_preds = np.array(all_v_preds)
+    all_v_trues = np.array(all_v_trues)
+    avg_test_physics_loss = np.mean(physics_losses)
+
+    # 计算评估指标
+    def calculate_metrics(true, pred, name):
+        mse = mean_squared_error(true, pred)
+        mae = mean_absolute_error(true, pred)
+        r2 = r2_score(true, pred)
+        print(f"{name} - MSE: {mse:.6f}, MAE: {mae:.6f}, R²: {r2:.6f}")
+        return {'MSE': mse, 'MAE': mae, 'R2': r2}
+
+    print("激活剂u评估指标:")
+    u_metrics = calculate_metrics(all_u_trues, all_u_preds, 'u')
+
+    print("\n抑制剂v评估指标:")
+    v_metrics = calculate_metrics(all_v_trues, all_v_preds, 'v')
+
+    print(f"\n平均物理损失: {avg_test_physics_loss:.6f}")
+
+    # 可视化预测结果（修复梯度分离问题）
+    plt.figure(figsize=(16, 8))
+
+    # 子图1：u的预测值vs真实值
+    plt.subplot(1, 4, 1)
+    plt.scatter(all_u_trues, all_u_preds, alpha=0.5, s=2, c='green')
+    min_val, max_val = min(all_u_trues.min(), all_u_preds.min()), max(all_u_trues.max(), all_u_preds.max())
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2)
+    plt.xlabel('真实值')
+    plt.ylabel('预测值')
+    plt.title(f'u (activator) (R²={u_metrics["R2"]:.4f})')
+    plt.grid(True, alpha=0.3)
+
+    # 子图2：v的预测值vs真实值
+    plt.subplot(1, 4, 2)
+    plt.scatter(all_v_trues, all_v_preds, alpha=0.5, s=2, c='orange')
+    min_val, max_val = min(all_v_trues.min(), all_v_preds.min()), max(all_v_trues.max(), all_v_preds.max())
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2)
+    plt.xlabel('真实值')
+    plt.ylabel('预测值')
+    plt.title(f'v (inhibitor) (R²={v_metrics["R2"]:.4f})')
+    plt.grid(True, alpha=0.3)
+
+    # 子图3：单个样本u的预测对比
+    plt.subplot(1, 4, 3)
+    test_batch = next(iter(test_loader))
+    uv0_batch, trunk_batch, u_true_batch, v_true_batch = [x.to(device) for x in test_batch]
+    with torch.no_grad():
+        u_pred, v_pred = model(uv0_batch, trunk_batch)
+
+    sample_idx = 0
+    # 关键修复：使用detach()分离梯度
+    plt.plot(u_true_batch[sample_idx].cpu().numpy(), label='真实值', linewidth=1.5, color='green')
+    plt.plot(u_pred[sample_idx].detach().cpu().numpy(), label='预测值', linewidth=1.5, linestyle='--', color='green')
+    plt.xlabel('空间点索引')
+    plt.ylabel('u值')
+    plt.title('单个样本u预测对比')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 子图4：单个样本v的预测对比
+    plt.subplot(1, 4, 4)
+    plt.plot(v_true_batch[sample_idx].cpu().numpy(), label='真实值', linewidth=1.5, color='orange')
+    plt.plot(v_pred[sample_idx].detach().cpu().numpy(), label='预测值', linewidth=1.5, linestyle='--', color='orange')
+    plt.xlabel('空间点索引')
+    plt.ylabel('v值')
+    plt.title('单个样本v预测对比')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/prediction_comparison.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 保存评估指标
+    eval_metrics = {
+        'u': u_metrics,
+        'v': v_metrics,
+        'avg_physics_loss': avg_test_physics_loss
+    }
+
+    with open(f'{save_dir}/evaluation_metrics.json', 'w') as f:
+        json.dump(eval_metrics, f, indent=4)
+
+    print(f"\n预测对比图已保存至: {save_dir}/prediction_comparison.png")
+    print(f"评估指标已保存至: {save_dir}/evaluation_metrics.json")
+
+    return eval_metrics
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from tqdm import tqdm
+
+# 先定义device（确保全局可用，或在函数内定义）
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==================== 10. 预测vs真实动态对比动画 ====================
+def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_data,
+                                     save_path='saved_figures/prediction_comparison.gif',
+                                     group_idx=0, time_steps=None):
+    """
+    生成预测值与真实值的动态对比动画
+    :param model: 训练好的模型
+    :param u_data: 真实u数据 [groups, time, x, y]
+    :param v_data: 真实v数据 [groups, time, x, y]
+    :param t_data: 时间坐标
+    :param x_data: X坐标
+    :param y_data: Y坐标
+    :param save_path: 保存路径
+    :param group_idx: 选择哪个组的数据进行对比
+    :param time_steps: 选择哪些时间步（None则用全部）
+    """
+    print("\n=== 生成预测vs真实动态对比动画 ===")
+    model.eval()  # 模型设为评估模式
+    model = model.to(device)  # 确保模型在指定设备上（关键：和输入张量对齐）
+
+    # 选择时间步
+    if time_steps is None:
+        time_steps = range(0, len(t_data), 5)  # 每隔5步取一次，加快动画生成
+    else:
+        time_steps = time_steps
+
+    # 获取该组的完整数据
+    group_u_data = u_data[group_idx]  # [time, x, y]
+    group_v_data = v_data[group_idx]  # [time, x, y]
+
+    # 创建空间网格
+    X, Y = np.meshgrid(x_data, y_data, indexing='ij')
+    x_flat = X.flatten()
+    y_flat = Y.flatten()
+    total_spatial_points = len(x_flat)
+
+    # 初始化预测结果存储
+    pred_u_all = []
+    pred_v_all = []
+
+    # 以t=0为初始条件，逐时间步预测
+    with torch.no_grad():  # 禁用梯度计算，节省内存+加快速度
+        # 初始条件（t=0）
+        u0 = group_u_data[0].flatten()
+        v0 = group_v_data[0].flatten()
+        uv0 = np.concatenate([u0, v0], axis=0).astype(np.float32)
+        # 【修改1：显式指定dtype=torch.float32，确保类型匹配】
+        uv0_tensor = torch.tensor(uv0, dtype=torch.float32).unsqueeze(0).to(device)
+
+        # 对每个目标时间步进行预测
+        for t_idx in tqdm(time_steps, desc="生成预测结果"):
+            # 计算时间间隔
+            dt = t_data[t_idx] - t_data[0]
+
+            # 构建trunk输入 [1, num_points, 3] (dt, x, y)
+            dt_array = np.full(total_spatial_points, dt, dtype=np.float32)
+            trunk_input = np.stack([dt_array, x_flat, y_flat], axis=-1)
+            trunk_input = trunk_input.reshape(1, total_spatial_points, 3)
+            # 【修改2：显式指定dtype=torch.float32，确保类型匹配】
+            trunk_tensor = torch.tensor(trunk_input, dtype=torch.float32).to(device)
+
+            # 模型预测（此时输入和模型参数都是float32，设备也一致）
+            u_pred, v_pred = model(uv0_tensor, trunk_tensor)
+
+            # 重塑为2D
+            u_pred_2d = u_pred.cpu().numpy().reshape(len(x_data), len(y_data))
+            v_pred_2d = v_pred.cpu().numpy().reshape(len(x_data), len(y_data))
+
+            pred_u_all.append(u_pred_2d)
+            pred_v_all.append(v_pred_2d)
+
+    # 确定颜色范围（使用真实值的5%-95%分位数，保证对比公平）
+    u_vals = group_u_data[list(time_steps)].flatten()  # 【小优化：time_steps转list避免索引警告】
+    v_vals = group_v_data[list(time_steps)].flatten()
+    u_vmin, u_vmax = np.percentile(u_vals, [5, 95])
+    v_vmin, v_vmax = np.percentile(v_vals, [5, 95])
+
+    # 创建画布（2行2列：真实u/预测u | 真实v/预测v）
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+    ax1, ax2 = axes[0]  # 第一行：真实u | 预测u
+    ax3, ax4 = axes[1]  # 第二行：真实v | 预测v
+
+    # 初始化图像（注意：imshow默认是(y,x)，需要调整origin='lower'保证坐标对齐）
+    im1 = ax1.imshow(group_u_data[time_steps[0]], cmap='RdBu_r', vmin=u_vmin, vmax=u_vmax,
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
+                     origin='lower')  # 【小优化：添加origin='lower'，坐标更直观】
+    im2 = ax2.imshow(pred_u_all[0], cmap='RdBu_r', vmin=u_vmin, vmax=u_vmax,
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
+                     origin='lower')
+    im3 = ax3.imshow(group_v_data[time_steps[0]], cmap='RdYlBu_r', vmin=v_vmin, vmax=v_vmax,
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
+                     origin='lower')
+    im4 = ax4.imshow(pred_v_all[0], cmap='RdYlBu_r', vmin=v_vmin, vmax=v_vmax,
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
+                     origin='lower')
+
+    # 设置标题和标签
+    title1 = ax1.set_title(f'Group {group_idx}, t={t_data[time_steps[0]]:.2f}\nTrue u (activator)')
+    title2 = ax2.set_title(f'Group {group_idx}, t={t_data[time_steps[0]]:.2f}\nPredicted u (activator)')
+    title3 = ax3.set_title(f'Group {group_idx}, t={t_data[time_steps[0]]:.2f}\nTrue v (inhibitor)')
+    title4 = ax4.set_title(f'Group {group_idx}, t={t_data[time_steps[0]]:.2f}\nPredicted v (inhibitor)')
+
+    for ax in [ax1, ax2, ax3, ax4]:
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_aspect('equal')  # 【小优化：保持XY轴比例一致】
+
+    # 添加颜色条（统一颜色条宽度，更美观）
+    cbar1 = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+    cbar1.set_label('u value')
+    cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    cbar2.set_label('u value')
+    cbar3 = fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+    cbar3.set_label('v value')
+    cbar4 = fig.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+    cbar4.set_label('v value')
+
+    # 调整子图间距，避免重叠
+    plt.tight_layout()
+
+    # 更新函数
+    def update(frame):
+        t_idx = time_steps[frame]
+        # 更新图像数据
+        im1.set_data(group_u_data[t_idx])
+        im2.set_data(pred_u_all[frame])
+        im3.set_data(group_v_data[t_idx])
+        im4.set_data(pred_v_all[frame])
+
+        # 更新标题
+        title1.set_text(f'Group {group_idx}, t={t_data[t_idx]:.2f}\nTrue u (activator)')
+        title2.set_text(f'Group {group_idx}, t={t_data[t_idx]:.2f}\nPredicted u (activator)')
+        title3.set_text(f'Group {group_idx}, t={t_data[t_idx]:.2f}\nTrue v (inhibitor)')
+        title4.set_text(f'Group {group_idx}, t={t_data[t_idx]:.2f}\nPredicted v (inhibitor)')
+
+        return im1, im2, im3, im4, title1, title2, title3, title4
+
+    # 生成动画（添加repeat=True，动画循环播放）
+    ani = animation.FuncAnimation(
+        fig, update, frames=len(time_steps),
+        interval=300, blit=True, repeat=True
+    )
+
+    # 保存动画（添加writer参数的fps，确保播放速度稳定）
+    ani.save(save_path, writer='pillow', dpi=150, fps=5)
+    plt.close(fig)  # 关闭画布，释放内存
+    print(f"预测vs真实动态对比动画已保存至: {save_path}")
+
+# ==================== 11. 主程序 ====================
+if __name__ == "__main__":
+    # 配置参数
+    DATA_PATH = "D:/浏览器/2D_diff-react_NA_NA.h5"
+    MAX_GROUPS = 100
+    USE_GROUPS = 50
+    NUM_SAMPLES_PER_GROUP = 20
+    NUM_POINTS_PER_SAMPLE = 200
+    MAX_TIME_INTERVAL = 10
+    BATCH_SIZE = 32
+    HIDDEN_DIM = 64
+    NUM_BASIS = 32
+    NUM_EPOCHS = 1000
+    LR = 0.0005
+
+    # 1. 加载数据（包含u和v）
+    u_data, v_data, t_data, x_data, y_data = load_2d_diffusion_data(
+        h5_path=DATA_PATH,
+        max_groups=MAX_GROUPS,
+        use_first_n_groups=USE_GROUPS
+    )
+
+    # 2. 可视化数据集样本
+    visualize_dataset_samples(u_data, v_data, t_data, x_data, y_data)
+
+    #生成演化动画（可选）
+    create_evolution_gif(u_data, v_data, t_data, x_data, y_data)
+
+    # 3. 预处理训练数据
+    uv0_array, trunk_array, u_true_array, v_true_array, coords = prepare_training_data(
+        u_data, v_data, t_data, x_data, y_data,
+        num_samples_per_group=NUM_SAMPLES_PER_GROUP,
+        num_points_per_sample=NUM_POINTS_PER_SAMPLE,
+        max_time_interval=MAX_TIME_INTERVAL
+    )
+
+    # 4. 创建数据加载器
+    train_loader, val_loader, test_loader, indices = create_data_loaders(
+        uv0_array, trunk_array, u_true_array, v_true_array,
+        batch_size=BATCH_SIZE
+    )
+
+    # 5. 创建模型
+    print("\n=== 创建FitzHugh-Nagumo DeepONet模型 ===")
+    branch_input_dim = uv0_array.shape[1]  # u0 + v0
+    trunk_input_dim = 3
+    model = FitzHughNagumoDeepONet(
+        branch_input_dim=branch_input_dim,
+        trunk_input_dim=trunk_input_dim,
+        hidden_dim=HIDDEN_DIM,
+        num_basis=NUM_BASIS
+    ).to(device)
+
+    # 打印模型信息
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"模型参数总数: {total_params:,}")
+    print(f"Branch输入维度: {branch_input_dim} (u0 + v0)")
+    print(f"Trunk输入维度: {trunk_input_dim}")
+
+    # 6. 训练模型
+    model, log_data = train_model(
+        model, train_loader, val_loader,
+        num_epochs=NUM_EPOCHS,
+        lr=LR
+    )
+
+    # 7. 可视化训练结果
+    visualize_training_results(log_data)
+
+    # 8. 评估模型
+    eval_metrics = evaluate_model(model, test_loader)
+
+    # 9. 生成预测vs真实动态对比动画
+    create_prediction_comparison_gif(
+        model, u_data, v_data, t_data, x_data, y_data,
+        save_path='saved_figures/prediction_comparison.gif',
+        group_idx=0,  # 选择第0组进行对比
+        time_steps=range(0, 101, 5)  # 每隔5个时间步生成一帧
+    )
+
+    print("\n=== 所有任务完成 ===")
+    print("生成的文件列表:")
+    print("  1. saved_figures/dataset_samples.png - 数据集样本可视化（u和v）")
+    print("  2. saved_figures/evolution.gif - 原始数据演化动画")
+    print("  3. saved_figures/training_loss_curves.png - 训练损失曲线")
+    print("  4. saved_figures/prediction_comparison.png - u和v预测对比图")
+    print("  5. saved_figures/prediction_comparison.gif - 预测vs真实动态对比动画")
+    print("  6. saved_figures/evaluation_metrics.json - 评估指标")
+    print("  7. models/best_model.pth - 最佳模型权重")
+    print("  8. models/training_log.json - 训练日志")
