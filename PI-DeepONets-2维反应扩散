@@ -1115,7 +1115,6 @@ def evaluate_model(model, test_loader, save_dir='saved_figures'):
 
     return eval_metrics
 
-
 # ==================== 10. 预测vs真实动态对比动画 ====================
 def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_data,
                                      save_path='saved_figures/prediction_comparison.gif',
@@ -1133,7 +1132,8 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
     :param time_steps: 选择哪些时间步（None则用全部）
     """
     print("\n=== 生成预测vs真实动态对比动画 ===")
-    model.eval()
+    model.eval()  # 模型设为评估模式
+    model = model.to(device)  # 确保模型在指定设备上（关键：和输入张量对齐）
 
     # 选择时间步
     if time_steps is None:
@@ -1155,19 +1155,13 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
     pred_u_all = []
     pred_v_all = []
 
-    # 加载归一化scaler
-    scaler_mean = np.load('models/uv0_scaler_mean.npy')
-    scaler_scale = np.load('models/uv0_scaler_scale.npy')
-
     # 以t=0为初始条件，逐时间步预测
-    with torch.no_grad():
+    with torch.no_grad():  # 禁用梯度计算，节省内存+加快速度
         # 初始条件（t=0）
         u0 = group_u_data[0].flatten()
         v0 = group_v_data[0].flatten()
         uv0 = np.concatenate([u0, v0], axis=0).astype(np.float32)
-        # 【新增】归一化初始条件
-        uv0 = (uv0 - scaler_mean) / scaler_scale
-        uv0_tensor = torch.tensor(uv0).unsqueeze(0).to(device)
+        uv0_tensor = torch.tensor(uv0, dtype=torch.float32).unsqueeze(0).to(device)
 
         # 对每个目标时间步进行预测
         for t_idx in tqdm(time_steps, desc="生成预测结果"):
@@ -1178,9 +1172,10 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
             dt_array = np.full(total_spatial_points, dt, dtype=np.float32)
             trunk_input = np.stack([dt_array, x_flat, y_flat], axis=-1)
             trunk_input = trunk_input.reshape(1, total_spatial_points, 3)
-            trunk_tensor = torch.tensor(trunk_input).to(device)
+            # 【修改2：显式指定dtype=torch.float32，确保类型匹配】
+            trunk_tensor = torch.tensor(trunk_input, dtype=torch.float32).to(device)
 
-            # 模型预测
+            # 模型预测（此时输入和模型参数都是float32，设备也一致）
             u_pred, v_pred = model(uv0_tensor, trunk_tensor)
 
             # 重塑为2D
@@ -1191,8 +1186,8 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
             pred_v_all.append(v_pred_2d)
 
     # 确定颜色范围（使用真实值的5%-95%分位数，保证对比公平）
-    u_vals = group_u_data[time_steps].flatten()
-    v_vals = group_v_data[time_steps].flatten()
+    u_vals = group_u_data[list(time_steps)].flatten()  # 【小优化：time_steps转list避免索引警告】
+    v_vals = group_v_data[list(time_steps)].flatten()
     u_vmin, u_vmax = np.percentile(u_vals, [5, 95])
     v_vmin, v_vmax = np.percentile(v_vals, [5, 95])
 
@@ -1201,15 +1196,19 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
     ax1, ax2 = axes[0]  # 第一行：真实u | 预测u
     ax3, ax4 = axes[1]  # 第二行：真实v | 预测v
 
-    # 初始化图像
+    # 初始化图像（注意：imshow默认是(y,x)，需要调整origin='lower'保证坐标对齐）
     im1 = ax1.imshow(group_u_data[time_steps[0]], cmap='RdBu_r', vmin=u_vmin, vmax=u_vmax,
-                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()])
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
+                     origin='lower')  # 【小优化：添加origin='lower'，坐标更直观】
     im2 = ax2.imshow(pred_u_all[0], cmap='RdBu_r', vmin=u_vmin, vmax=u_vmax,
-                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()])
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
+                     origin='lower')
     im3 = ax3.imshow(group_v_data[time_steps[0]], cmap='RdYlBu_r', vmin=v_vmin, vmax=v_vmax,
-                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()])
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
+                     origin='lower')
     im4 = ax4.imshow(pred_v_all[0], cmap='RdYlBu_r', vmin=v_vmin, vmax=v_vmax,
-                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()])
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
+                     origin='lower')
 
     # 设置标题和标签
     title1 = ax1.set_title(f'Group {group_idx}, t={t_data[time_steps[0]]:.2f}\nTrue u (activator)')
@@ -1220,8 +1219,9 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
     for ax in [ax1, ax2, ax3, ax4]:
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
+        ax.set_aspect('equal')  # 【小优化：保持XY轴比例一致】
 
-    # 添加颜色条
+    # 添加颜色条（统一颜色条宽度，更美观）
     cbar1 = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
     cbar1.set_label('u value')
     cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
@@ -1230,6 +1230,9 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
     cbar3.set_label('v value')
     cbar4 = fig.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
     cbar4.set_label('v value')
+
+    # 调整子图间距，避免重叠
+    plt.tight_layout()
 
     # 更新函数
     def update(frame):
@@ -1248,17 +1251,16 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
 
         return im1, im2, im3, im4, title1, title2, title3, title4
 
-    # 生成动画
+    # 生成动画（添加repeat=True，动画循环播放）
     ani = animation.FuncAnimation(
         fig, update, frames=len(time_steps),
-        interval=300, blit=True
+        interval=300, blit=True, repeat=True
     )
 
-    # 保存动画
-    ani.save(save_path, writer='pillow', dpi=150)
-    plt.close()
+    # 保存动画（添加writer参数的fps，确保播放速度稳定）
+    ani.save(save_path, writer='pillow', dpi=150, fps=5)
+    plt.close(fig)  # 关闭画布，释放内存
     print(f"预测vs真实动态对比动画已保存至: {save_path}")
-
 
 # ==================== 11. 主程序 ====================
 if __name__ == "__main__":
@@ -1272,7 +1274,7 @@ if __name__ == "__main__":
     BATCH_SIZE = 16
     HIDDEN_DIM = 128
     NUM_BASIS = 64
-    NUM_EPOCHS = 10
+    NUM_EPOCHS = 1
     LR = 0.001
 
     # 1. 加载数据（包含u和v）
