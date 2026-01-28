@@ -1,0 +1,994 @@
+import h5py
+import numpy as np
+import warnings
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset
+import math
+import os
+import json  # 新增：保存训练日志
+
+warnings.filterwarnings('ignore')
+
+# Set random seeds
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+
+# Device selection
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# ==================== 加载一维Burgers方程数据 ====================
+print("=== LOADING 1D BURGERS EQUATION DATA ===")
+filepath = "D:/浏览器/1D_Burgers_Sols_Nu0.001.hdf5"
+
+# 加载完整数据集
+with h5py.File(filepath, 'r') as f:
+    t_coord = f['t-coordinate'][:]  # 时间坐标 (202,)
+    x_coord = f['x-coordinate'][:]  # 空间坐标 (1024,)
+    u_tensor = f['tensor'][:]  # 解张量 (10000, 201, 1024)
+print(f"时间坐标 t_coord: {t_coord.shape}")
+print(f"空间坐标 x_coord: {x_coord.shape}")
+print(f"解张量 u_tensor: {u_tensor.shape}")
+print(f"时间范围: t ∈ [{t_coord[0]:.2f}, {t_coord[-1]:.2f}]")
+print(f"空间范围: x ∈ [{x_coord[0]:.2f}, {x_coord[-1]:.2f}]")
+
+t_coord_for_tensor = t_coord[1:]  # 使用 t=0 之后的时间点 (201,)
+print(f"使用的t_coord_for_tensor形状: {t_coord_for_tensor.shape}")
+print(f"使用的时间范围: t ∈ [{t_coord_for_tensor[0]:.3f}, {t_coord_for_tensor[-1]:.3f}]")
+assert len(t_coord_for_tensor) == u_tensor.shape[1], "时间坐标与解张量时间维度不匹配"
+
+
+# ==================== 准备数据函数 ====================
+def prepare_burgers_data_3d(u_tensor, t_coord, x_coord, num_samples=1000):
+    """
+    准备3D Burgers方程数据集
+    根据论文描述: ∂_t u + ∂_x (u²/2) = ν/π ∂_{xx} u
+    输入: u(x, t0) - 初始条件
+    输出: u(x, t0+Δt) - 经过Δt时间后的解
+    u_tensor形状: (num_simulations, num_time_steps, num_space_points)
+    """
+    num_simulations, num_time_steps, num_space_points = u_tensor.shape
+
+    print(f"原始数据: {num_simulations}个模拟, {num_time_steps}个时间步, {num_space_points}个空间点")
+    print(f"时间步长: Δt ≈ {t_coord[1] - t_coord[0]:.4f}")
+    print(f"空间步长: Δx ≈ {x_coord[1] - x_coord[0]:.4f}")
+
+    # 确保有足够的样本
+    if num_samples > num_simulations * (num_time_steps - 10):
+        num_samples = num_simulations * (num_time_steps - 10)
+
+    source_functions = []  # 初始条件 + 时间信息
+    solutions = []  # 目标解
+    time_steps = []  # 时间间隔
+    t0_indices = []  # 初始时间索引
+    t1_indices = []  # 目标时间索引
+
+    print("Generating data samples for Burgers equation...")
+
+    samples_per_simulation = max(1, num_samples // num_simulations)
+
+    for sim_idx in tqdm(range(min(num_simulations, 100))):  # 限制模拟数量以加速
+        if len(source_functions) >= num_samples:
+            break
+
+        # 每个模拟生成多个样本
+        for _ in range(samples_per_simulation):
+            if len(source_functions) >= num_samples:
+                break
+
+            # 随机选择初始时间步 (避免使用最后的时间步)
+            t0_idx = np.random.randint(0, num_time_steps - 10)
+
+            # 随机选择时间间隔 (1到10个时间步)
+            Δt_idx = np.random.randint(1, 11)
+            t1_idx = t0_idx + Δt_idx
+
+            # 确保不超过范围
+            if t1_idx >= num_time_steps:
+                continue
+
+            # 初始条件 u(x, t0)
+            u0 = u_tensor[sim_idx, t0_idx, :]
+
+            # 目标解 u(x, t1)
+            u1 = u_tensor[sim_idx, t1_idx, :]
+
+            # 时间间隔 Δt
+            Δt = t_coord[t1_idx] - t_coord[t0_idx]
+
+            # 组合输入: [初始条件, 时间间隔]
+            source_input = np.concatenate([u0, [Δt]])
+
+            source_functions.append(source_input)
+            solutions.append(u1)
+            time_steps.append(Δt)
+            t0_indices.append(t0_idx)
+            t1_indices.append(t1_idx)
+
+    # 如果样本不够，再随机采样一些
+    while len(source_functions) < num_samples:
+        sim_idx = np.random.randint(0, num_simulations)
+        t0_idx = np.random.randint(0, num_time_steps - 10)
+        Δt_idx = np.random.randint(1, 11)
+        t1_idx = t0_idx + Δt_idx
+
+        if t1_idx >= num_time_steps:
+            continue
+
+        u0 = u_tensor[sim_idx, t0_idx, :]
+        u1 = u_tensor[sim_idx, t1_idx, :]
+        Δt = t_coord[t1_idx] - t_coord[t0_idx]
+
+        source_input = np.concatenate([u0, [Δt]])
+        source_functions.append(source_input)
+        solutions.append(u1)
+        time_steps.append(Δt)
+        t0_indices.append(t0_idx)
+        t1_indices.append(t1_idx)
+
+    source_functions = np.array(source_functions)
+    solutions = np.array(solutions)
+
+    print(f"\n生成 {len(source_functions)} 个样本")
+    print(f"输入维度: {source_functions.shape}")
+    print(f"输出维度: {solutions.shape}")
+    print(f"时间间隔范围: [{np.min(time_steps):.4f}, {np.max(time_steps):.4f}]")
+    print(f"平均时间间隔: {np.mean(time_steps):.4f}")
+    print(f"初始时间索引范围: [{np.min(t0_indices)}, {np.max(t0_indices)}]")
+    print(f"目标时间索引范围: [{np.min(t1_indices)}, {np.max(t1_indices)}]")
+
+    return x_coord, source_functions, solutions
+
+
+# 新增：数据增强函数
+def augment_burgers_data(train_sources, train_solutions, noise_level=1e-4):
+    """给训练集添加高斯噪声增强，提升泛化能力"""
+    # 仅对初始条件（前1024维）加噪声，Δt（最后1维）不加
+    noise = np.random.normal(0, noise_level, train_sources.shape)
+    noise[:, -1] = 0  # Δt保持不变
+    train_sources_aug = train_sources + noise
+    # 解也加少量噪声（模拟数值解误差）
+    train_solutions_aug = train_solutions + np.random.normal(0, noise_level / 10, train_solutions.shape)
+    return train_sources_aug, train_solutions_aug
+
+
+# 准备数据
+print("\n=== PREPARING 3D BURGERS EQUATION DATA ===")
+x, source_functions, solutions = prepare_burgers_data_3d(
+    u_tensor, t_coord_for_tensor, x_coord, num_samples=2000
+)
+
+# ==================== 可视化示例数据 ====================
+print("\n=== VISUALIZING SAMPLE DATA ===")
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+for i in range(6):
+    ax = axes[i // 3, i % 3]
+
+    # 提取初始条件 (排除最后的时间信息)
+    initial_condition = source_functions[i, :-1]
+    target_solution = solutions[i]
+    Δt = source_functions[i, -1]
+
+    ax.plot(x, initial_condition, 'g-', linewidth=2, label=f'u(x, t0)', alpha=0.8)
+    ax.plot(x, target_solution, 'b-', linewidth=2, label=f'u(x, t0+{Δt:.3f})', alpha=0.8)
+
+    ax.set_title(f'Sample {i + 1}, Δt = {Δt:.3f}', fontsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
+    ax.set_xlabel('x', fontsize=11)
+    ax.set_ylabel('u(x,t)', fontsize=11)
+    ax.set_xlim([x[0], x[-1]])
+
+plt.tight_layout()
+plt.savefig('burgers_sample_data.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
+class BurgersPhysicsInformedDeepONet(nn.Module):
+    def __init__(self, branch_input_dim, trunk_input_dim, hidden_dim=64, num_basis=32):  # 修改：降低模型容量
+        super(BurgersPhysicsInformedDeepONet, self).__init__()
+        self.num_basis = num_basis
+        self.hidden_dim = hidden_dim
+        self.pi = torch.tensor(math.pi).to(device)
+
+        # Branch network (处理初始条件+Δt) - 修改：添加Dropout正则化
+        self.branch_net = nn.Sequential(
+            nn.Linear(branch_input_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Dropout(0.1),  # 新增：Dropout抑制过拟合
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Dropout(0.1),  # 新增
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, num_basis)
+        )
+
+        # Trunk network (处理空间坐标x) - 修改：添加Dropout正则化
+        self.trunk_net = nn.Sequential(
+            nn.Linear(trunk_input_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Dropout(0.1),  # 新增
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Dropout(0.1),  # 新增
+            nn.Linear(hidden_dim, num_basis)
+        )
+
+        self.bias = nn.Parameter(torch.zeros(1))
+        self.nu_raw = nn.Parameter(torch.tensor(0.001))  # 修改：重命名为nu_raw，用于Softplus约束
+
+    def forward(self, branch_input, trunk_input):
+        """Forward pass - 确保计算图连续"""
+        # 确保输入在计算图中
+        branch_input = branch_input.requires_grad_(True)
+        trunk_input = trunk_input.requires_grad_(True)
+
+        branch_out = self.branch_net(branch_input)  # [batch_size, num_basis]
+
+        if trunk_input.dim() == 3:
+            batch_size, num_points, _ = trunk_input.shape
+            # 重塑时保持计算图
+            trunk_input_flat = trunk_input.reshape(-1, trunk_input.shape[-1])
+            trunk_out = self.trunk_net(trunk_input_flat)  # [batch_size*num_points, num_basis]
+            trunk_out = trunk_out.reshape(batch_size, num_points, self.num_basis)
+        else:
+            trunk_out = self.trunk_net(trunk_input)
+            trunk_out = trunk_out.unsqueeze(0)
+
+        # 内积计算: batch-wise dot product
+        output = torch.einsum('bi,bpi->bp', branch_out, trunk_out)
+        return output + self.bias
+
+    def compute_derivatives(self, branch_input, trunk_input):
+        """计算时空导数 - 修复梯度计算问题 + 新增ν非负约束"""
+        # 强制trunk_input在计算图中
+        trunk_input = trunk_input.clone().detach().requires_grad_(True)
+
+        # 计算u - 确保计算图完整
+        u = self.forward(branch_input, trunk_input)  # [batch_size, num_points]
+        batch_size, num_points = u.shape
+
+        # 初始化导数张量 (统一设备)
+        du_dx = torch.zeros(batch_size, num_points, 1, device=device)
+        du_squared_dx = torch.zeros(batch_size, num_points, 1, device=device)
+        d2u_dx2 = torch.zeros(batch_size, num_points, 1, device=device)
+
+        # 预计算空间步长
+        dx = x_coord[1] - x_coord[0]
+
+        # 批量计算梯度（避免循环中的计算图断裂）
+        try:
+            # 计算∂u/∂x - 批量处理
+            grad_u = torch.autograd.grad(
+                outputs=u,
+                inputs=trunk_input,
+                grad_outputs=torch.ones_like(u),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True  # 关键修复：允许未使用的张量
+            )[0]
+
+            if grad_u is not None:
+                du_dx = grad_u
+
+                # 计算u²
+                u_squared = u ** 2
+
+                # 计算∂(u²)/∂x
+                grad_u2 = torch.autograd.grad(
+                    outputs=u_squared,
+                    inputs=trunk_input,
+                    grad_outputs=torch.ones_like(u_squared),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0]
+
+                if grad_u2 is not None:
+                    du_squared_dx = grad_u2
+
+                # 计算二阶导数 ∂²u/∂x² (纯Torch实现，更稳定)
+                if num_points > 2 and grad_u is not None:
+                    # 提取一阶导数
+                    du_dx_flat = du_dx.squeeze(-1)  # [batch_size, num_points]
+
+                    # 中心差分计算二阶导数
+                    d2u_dx2_flat = torch.zeros_like(du_dx_flat)
+
+                    # 内部点：中心差分
+                    d2u_dx2_flat[:, 1:-1] = (du_dx_flat[:, 2:] - 2 * du_dx_flat[:, 1:-1] + du_dx_flat[:, :-2]) / (
+                            dx ** 2)
+
+                    # 边界点：二阶单边差分
+                    d2u_dx2_flat[:, 0] = (2 * du_dx_flat[:, 0] - 5 * du_dx_flat[:, 1] + 4 * du_dx_flat[:, 2] -
+                                          du_dx_flat[:, 3]) / (dx ** 2)
+                    d2u_dx2_flat[:, -1] = (2 * du_dx_flat[:, -1] - 5 * du_dx_flat[:, -2] + 4 * du_dx_flat[:, -3] -
+                                           du_dx_flat[:, -4]) / (dx ** 2)
+
+                    d2u_dx2 = d2u_dx2_flat.unsqueeze(-1)
+
+        except Exception as e:
+            print(f"Warning: Batch gradient computation failed: {str(e)[:100]}")
+            # 降级到逐样本计算
+            for b in range(batch_size):
+                try:
+                    u_b = u[b:b + 1, :]
+                    x_b = trunk_input[b:b + 1, :, :]
+
+                    # 逐样本计算梯度
+                    grad_u_b = torch.autograd.grad(
+                        outputs=u_b,
+                        inputs=x_b,
+                        grad_outputs=torch.ones_like(u_b),
+                        create_graph=True,
+                        retain_graph=True,
+                        allow_unused=True
+                    )[0]
+
+                    if grad_u_b is not None:
+                        du_dx[b:b + 1, :, :] = grad_u_b
+
+                        # 计算u²的梯度
+                        u_squared_b = u_b ** 2
+                        grad_u2_b = torch.autograd.grad(
+                            outputs=u_squared_b,
+                            inputs=x_b,
+                            grad_outputs=torch.ones_like(u_squared_b),
+                            create_graph=True,
+                            retain_graph=True,
+                            allow_unused=True
+                        )[0]
+
+                        if grad_u2_b is not None:
+                            du_squared_dx[b:b + 1, :, :] = grad_u2_b
+
+                except Exception as e2:
+                    print(f"Warning: Gradient computation failed for sample {b}: {str(e2)[:50]}")
+                    continue
+
+        # 修改：添加ν非负约束（Softplus确保ν≥0，beta=10让输出接近ReLU）
+        nu = torch.nn.functional.softplus(self.nu_raw, beta=10)
+        nu = torch.clamp(nu, min=0.0001)
+        return u, du_dx, du_squared_dx, d2u_dx2, nu
+
+
+def burgers_physics_loss(model, branch_input, x_input, u_true,
+                         lambda_physics=2.0, lambda_boundary=10.0,
+                         lambda_nu=3.0, compute_physics=True):
+    """一维Burgers方程物理损失函数 - 增加稳定性"""
+    if compute_physics:
+        # 计算导数
+        u_pred, du_dx, du_squared_dx, d2u_dx2, nu = model.compute_derivatives(branch_input, x_input)
+
+        # 数据损失 (MSE)
+        data_loss = torch.mean((u_pred - u_true) ** 2)
+
+        # Burgers方程物理损失
+        batch_size, num_points = u_pred.shape
+        initial_condition = branch_input[:, :-1]  # [batch_size, num_points]
+        Δt = branch_input[:, -1].unsqueeze(-1)  # [batch_size, 1]
+
+        # 时间导数 (有限差分) - 增加数值稳定性
+        time_derivative = (u_pred - initial_condition) / (Δt + 1e-8)  # 防止除零
+
+        # 处理可能的None梯度
+        du_squared_dx_safe = du_squared_dx if du_squared_dx is not None else torch.zeros_like(u_pred.unsqueeze(-1))
+        d2u_dx2_safe = d2u_dx2 if d2u_dx2 is not None else torch.zeros_like(u_pred.unsqueeze(-1))
+
+        # Burgers方程残差: ∂_t u + 0.5*∂_x(u²) - (ν/π)∂_xx u
+        burgers_residual = time_derivative + 0.5 * du_squared_dx_safe.squeeze(-1) - (
+                nu / model.pi) * d2u_dx2_safe.squeeze(-1)
+
+        # 修改：更严格的残差裁剪，防止梯度爆炸
+        burgers_residual = torch.clamp(burgers_residual, -1e2, 1e2)
+        physics_loss = torch.mean(burgers_residual ** 2)
+
+        # 周期性边界条件损失
+        u_left = u_pred[:, 0]
+        u_right = u_pred[:, -1]
+        boundary_loss = torch.mean((u_left - u_right) ** 2)
+
+        # 扩散系数正则化 (接近真实值0.001)
+        nu_loss = torch.mean((nu - 0.001) ** 2) * lambda_nu
+
+    else:
+        # 仅计算数据损失
+        u_pred = model(branch_input, x_input)
+        data_loss = torch.mean((u_pred - u_true) ** 2)
+        physics_loss = torch.tensor(0.0, device=u_pred.device)
+        boundary_loss = torch.tensor(0.0, device=u_pred.device)
+        nu_loss = torch.tensor(0.0, device=u_pred.device)
+
+    # 总损失
+    total_loss = data_loss + lambda_physics * physics_loss + lambda_boundary * boundary_loss + nu_loss
+
+    return total_loss, data_loss, physics_loss, boundary_loss, nu_loss
+
+
+# ==================== 数据加载器 ====================
+def setup_burgers_data_loaders(source_functions, solutions, x, batch_size=16):  # 修改：batch_size从32→16
+    """设置Burgers方程数据加载器"""
+    # 划分数据集（已打乱）
+    total_samples = len(source_functions)
+    shuffle_idx = np.random.permutation(total_samples)
+    source_functions = source_functions[shuffle_idx]
+    solutions = solutions[shuffle_idx]
+
+    train_size = int(0.7 * total_samples)  # 70% 训练
+    val_size = int(0.15 * total_samples)  # 15% 验证
+    test_size = total_samples - train_size - val_size  # 15% 测试
+
+    train_sources = source_functions[:train_size]
+    train_solutions = solutions[:train_size]
+
+    val_sources = source_functions[train_size:train_size + val_size]
+    val_solutions = solutions[train_size:train_size + val_size]
+
+    test_sources = source_functions[train_size + val_size:]
+    test_solutions = solutions[train_size + val_size:]
+
+    # 新增：训练集数据增强
+    train_sources, train_solutions = augment_burgers_data(train_sources, train_solutions)
+
+    print(f"数据集划分:")
+    print(f"  训练集: {len(train_sources)} 样本 ({100 * len(train_sources) / total_samples:.1f}%)")
+    print(f"  验证集: {len(val_sources)} 样本 ({100 * len(val_sources) / total_samples:.1f}%)")
+    print(f"  测试集: {len(test_sources)} 样本 ({100 * len(test_sources) / total_samples:.1f}%)")
+
+    # 转换为张量 (统一设备)
+    x_tensor = torch.tensor(x, dtype=torch.float32, device=device).unsqueeze(1)
+
+    # 扩展x到批次维度
+    train_x = x_tensor.unsqueeze(0).repeat(len(train_sources), 1, 1)
+    val_x = x_tensor.unsqueeze(0).repeat(len(val_sources), 1, 1)
+
+    # 创建数据集 (使用CPU存储，加载时移到GPU)
+    train_dataset = TensorDataset(
+        torch.tensor(train_sources, dtype=torch.float32),
+        train_x.cpu(),
+        torch.tensor(train_solutions, dtype=torch.float32)
+    )
+
+    val_dataset = TensorDataset(
+        torch.tensor(val_sources, dtype=torch.float32),
+        val_x.cpu(),
+        torch.tensor(val_solutions, dtype=torch.float32)
+    )
+
+    # 数据加载器
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
+
+    test_data = (test_sources, test_solutions, x)
+
+    return train_loader, val_loader, test_data
+
+
+# ==================== 训练函数 ====================
+def train_burgers_deeponet(model, train_loader, val_loader,
+                           num_epochs=1000, lr=0.0005,
+                           lambda_physics=2.0, lambda_boundary=10.0, lambda_nu=3.0):  # 修改：调整损失权重
+    """训练Burgers方程DeepONet（新增早停、优化正则化）"""
+    # 修改：增强L2正则化（weight_decay从1e-5→5e-5）
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=5e-5)
+    # 修改：调整学习率调度器patience（20→25）
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, min_lr=1e-6)
+
+    # 存储损失
+    train_losses = {'total': [], 'data': [], 'physics': [], 'boundary': [], 'nu': []}
+    val_losses = {'total': [], 'data': [], 'physics': [], 'boundary': [], 'nu': []}
+
+    best_val_loss = float('inf')
+    best_model_state = None
+    early_stop_counter = 0  # 新增：早停计数器
+    early_stop_patience = 50  # 新增：早停耐心值
+    pbar = tqdm(range(num_epochs), desc="Training Burgers DeepONet")
+
+    for epoch in pbar:
+        # 训练阶段
+        model.train()
+        train_loss_epoch = {'total': 0, 'data': 0, 'physics': 0, 'boundary': 0, 'nu': 0}
+        batch_count = 0
+
+        for batch_sources, batch_x, batch_solutions in train_loader:
+            batch_count += 1
+            # 移到目标设备
+            batch_sources = batch_sources.to(device, non_blocking=True)
+            batch_x = batch_x.to(device, non_blocking=True)
+            batch_solutions = batch_solutions.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+
+            try:
+                # 计算损失
+                total_loss, data_loss, physics_loss, boundary_loss, nu_loss = burgers_physics_loss(
+                    model, batch_sources, batch_x, batch_solutions,
+                    lambda_physics=lambda_physics,
+                    lambda_boundary=lambda_boundary,
+                    lambda_nu=lambda_nu,
+                    compute_physics=True
+                )
+
+                # 检查损失是否为NaN/Inf
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"\nWarning: NaN/Inf loss detected in batch {batch_count}, skipping")
+                    continue
+
+                # 反向传播 + 修改：降低梯度裁剪阈值（5.0→2.0），增强稳定性
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+                optimizer.step()
+
+                # 累加损失
+                train_loss_epoch['total'] += total_loss.item()
+                train_loss_epoch['data'] += data_loss.item()
+                train_loss_epoch['physics'] += physics_loss.item()
+                train_loss_epoch['boundary'] += boundary_loss.item()
+                train_loss_epoch['nu'] += nu_loss.item()
+
+            except Exception as e:
+                print(f"\nWarning: Error in batch {batch_count}: {str(e)[:100]}")
+                continue
+
+        # 计算平均损失（跳过错误批次）
+        if batch_count > 0:
+            for key in train_loss_epoch:
+                train_loss_epoch[key] /= batch_count
+        else:
+            train_loss_epoch = {'total': 0, 'data': 0, 'physics': 0, 'boundary': 0, 'nu': 0}
+
+        # 验证阶段
+        model.eval()
+        val_loss_epoch = {'total': 0, 'data': 0, 'physics': 0, 'boundary': 0, 'nu': 0}
+        val_batch_count = 0
+
+        with torch.no_grad():
+            for batch_sources, batch_x, batch_solutions in val_loader:
+                val_batch_count += 1
+                batch_sources = batch_sources.to(device, non_blocking=True)
+                batch_x = batch_x.to(device, non_blocking=True)
+                batch_solutions = batch_solutions.to(device, non_blocking=True)
+
+                # 临时启用梯度计算物理损失
+                with torch.enable_grad():
+                    total_loss, data_loss, physics_loss, boundary_loss, nu_loss = burgers_physics_loss(
+                        model, batch_sources, batch_x, batch_solutions,
+                        lambda_physics=lambda_physics,
+                        lambda_boundary=lambda_boundary,
+                        lambda_nu=lambda_nu,
+                        compute_physics=True
+                    )
+
+                # 修改：验证阶段也检查损失有效性
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    continue
+
+                val_loss_epoch['total'] += total_loss.item()
+                val_loss_epoch['data'] += data_loss.item()
+                val_loss_epoch['physics'] += physics_loss.item()
+                val_loss_epoch['boundary'] += boundary_loss.item()
+                val_loss_epoch['nu'] += nu_loss.item()
+
+        # 计算平均损失
+        if val_batch_count > 0:
+            for key in val_loss_epoch:
+                val_loss_epoch[key] /= val_batch_count
+        else:
+            val_loss_epoch = {'total': 0, 'data': 0, 'physics': 0, 'boundary': 0, 'nu': 0}
+
+        # 记录损失
+        for key in train_loss_epoch:
+            train_losses[key].append(train_loss_epoch[key])
+            val_losses[key].append(val_loss_epoch[key])
+
+        # 更新学习率
+        scheduler.step(val_loss_epoch['total'])
+
+        # 保存最佳模型
+        if val_loss_epoch['total'] < best_val_loss:
+            best_val_loss = val_loss_epoch['total']
+            best_model_state = model.state_dict().copy()
+            early_stop_counter = 0  # 重置早停计数器
+            # 确保保存目录存在
+            os.makedirs('./models', exist_ok=True)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss_epoch['total'],
+                'val_loss': val_loss_epoch['total'],
+            }, './models/best_burgers_model.pth')
+        else:
+            early_stop_counter += 1  # 早停计数器+1
+
+        # 新增：早停判断
+        if early_stop_counter >= early_stop_patience:
+            print(f"\n早停触发：Epoch {epoch + 1}, 验证集损失连续{early_stop_patience}epoch未下降")
+            break
+
+        # 更新进度条 - 修改：显示nu的约束后值（而非原始值）
+        nu_constrained = torch.nn.functional.softplus(model.nu_raw, beta=10).item()
+        pbar.set_postfix({
+            'Train': f'{train_loss_epoch["total"]:.2e}',
+            'Val': f'{val_loss_epoch["total"]:.2e}',
+            'Data': f'{train_loss_epoch["data"]:.2e}',
+            'Phys': f'{train_loss_epoch["physics"]:.2e}',
+            'ν': f'{nu_constrained:.6f}',  # 显示约束后的值
+            'LR': f'{optimizer.param_groups[0]["lr"]:.2e}'
+        })
+
+        # 每100个epoch打印详细损失
+        if (epoch + 1) % 100 == 0:
+            print(f"\nEpoch {epoch + 1}/{num_epochs}:")
+            print(f"  Train - Total: {train_loss_epoch['total']:.2e}, Data: {train_loss_epoch['data']:.2e}, "
+                  f"Physics: {train_loss_epoch['physics']:.2e}, Boundary: {train_loss_epoch['boundary']:.2e}")
+            print(f"  Val   - Total: {val_loss_epoch['total']:.2e}, Data: {val_loss_epoch['data']:.2e}, "
+                  f"Physics: {val_loss_epoch['physics']:.2e}, Boundary: {val_loss_epoch['boundary']:.2e}")
+            print(f"  Learned ν: {nu_constrained:.6f}, ν/π: {nu_constrained / math.pi:.6f}")
+
+    pbar.close()
+
+    # 加载最佳模型
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"\nLoaded best model with validation loss: {best_val_loss:.2e}")
+
+    # 新增：保存训练日志
+    log_data = {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'best_val_loss': best_val_loss,
+        'final_nu': nu_constrained,
+        'hyperparameters': {
+            'lr': lr,
+            'lambda_physics': lambda_physics,
+            'lambda_boundary': lambda_boundary,
+            'lambda_nu': lambda_nu,
+            'batch_size': train_loader.batch_size,
+            'hidden_dim': model.hidden_dim,
+            'num_basis': model.num_basis
+        }
+    }
+    with open('./models/training_log.json', 'w') as f:
+        json.dump(log_data, f, indent=4)
+
+    return train_losses, val_losses
+
+
+# ==================== 主程序 ====================
+if __name__ == "__main__":
+    # 创建模型
+    print("\n=== CREATING BURGERS EQUATION DEEPONET ===")
+    branch_input_dim = source_functions.shape[1]  # u0 + Δt
+    trunk_input_dim = 1  # x坐标
+
+    model = BurgersPhysicsInformedDeepONet(
+        branch_input_dim=branch_input_dim,
+        trunk_input_dim=trunk_input_dim,
+        hidden_dim=64,  # 修改：从128→64
+        num_basis=32  # 修改：从64→32
+    ).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"模型架构:")
+    print(f"  - 分支网络输入维度: {branch_input_dim} (u0: {branch_input_dim - 1}点 + Δt: 1)")
+    print(f"  - 主干网络输入维度: {trunk_input_dim} (x坐标)")
+    print(f"  - 隐藏层维度: {model.hidden_dim}")
+    print(f"  - 基函数数量: {model.num_basis}")
+    print(f"  - 总参数量: {total_params:,}")
+    # 修改：显示初始约束后的ν
+    initial_nu = torch.nn.functional.softplus(model.nu_raw, beta=10).item()
+    print(f"  - 初始扩散系数 ν: {initial_nu:.6f}")
+    print(f"  - 初始 ν/π: {initial_nu / math.pi:.6f}")
+    print(f"  - 空间点数: {len(x)}")
+    print(f"  - 计算域大小 Lx: {x[-1] - x[0]:.2f}")
+
+    # 设置数据加载器
+    print("\n=== SETTING UP DATA LOADERS ===")
+    train_loader, val_loader, test_data = setup_burgers_data_loaders(
+        source_functions, solutions, x, batch_size=16  # 修改：batch_size从32→16
+    )
+
+    # 训练模型
+    print("\n=== STARTING TRAINING ===")
+    print(f"Burgers方程: ∂_t u + ∂_x (u²/2) = ν/π ∂_{{xx}} u")
+    print(f"训练参数:")
+    print(f"  - 训练周期: 1000")
+    print(f"  - 初始学习率: 0.0005")
+    print(f"  - 物理损失权重 λ_physics: 2.0")  # 修改：从5.0→1.5
+    print(f"  - 边界损失权重 λ_boundary: 10.0")
+    print(f"  - 扩散系数正则化权重 λ_nu: 3.0")  # 修改：从1.0→0.3
+    print(f"  - Batch size: {train_loader.batch_size}")
+
+    train_losses, val_losses = train_burgers_deeponet(
+        model, train_loader, val_loader,
+        num_epochs=1000, lr=0.0005,
+        lambda_physics=2.0,
+        lambda_boundary=10.0,
+        lambda_nu=3.0
+    )
+
+    # 可视化训练历史
+    print("\n=== TRAINING HISTORY ===")
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+    losses_to_plot = ['total', 'data', 'physics', 'boundary', 'nu']
+    titles = ['Total Loss', 'Data Loss', 'Physics Loss', 'Boundary Loss', 'ν Regularization']
+
+    for idx, (loss_key, title) in enumerate(zip(losses_to_plot, titles)):
+        ax = axes[idx // 3, idx % 3]
+        train_vals = np.array(train_losses[loss_key]) + 1e-8
+        val_vals = np.array(val_losses[loss_key]) + 1e-8
+
+        ax.plot(train_vals, label='Train', alpha=0.8, linewidth=2)
+        ax.plot(val_vals, label='Validation', alpha=0.8, linewidth=2, color='orange')
+        ax.set_title(f'{title}', fontsize=14)
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Loss', fontsize=12)
+        ax.set_yscale('log')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=11)
+        ax.tick_params(axis='both', which='major', labelsize=10)
+
+    # 绘制学习到的扩散系数
+    ax = axes[1, 2]
+    ax.set_title('Learned Diffusion Coefficient', fontsize=14)
+    learned_nu = torch.nn.functional.softplus(model.nu_raw, beta=10).item()  # 修改：获取约束后的值
+    ax.text(0.5, 0.6, f'ν = {learned_nu:.6f}\nν/π = {learned_nu / math.pi:.6f}\nTrue ν = 0.001',
+            ha='center', va='center', fontsize=16, transform=ax.transAxes)
+    ax.axis('off')
+
+    plt.tight_layout()
+    plt.savefig('training_history_burgers.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # ==================== 模型评估 ====================
+    print("\n=== MODEL EVALUATION ON TEST SET ===")
+    test_sources, test_solutions, test_x = test_data
+
+    model.eval()
+    predictions = []
+    physics_residuals = []
+    l2_errors = []
+    boundary_errors = []
+
+    # 修改：评估全部测试样本（或可配置）
+    eval_num = len(test_sources)  # 从200→全部
+    print(f"Evaluating {eval_num} test samples...")
+
+    for i in tqdm(range(eval_num)):
+        # 准备输入
+        source_tensor = torch.tensor(test_sources[i:i + 1], dtype=torch.float32).to(device)
+        x_tensor = torch.tensor(test_x, dtype=torch.float32).unsqueeze(1).unsqueeze(0).to(device)
+
+        # 1. 预测
+        with torch.no_grad():
+            u_pred = model(source_tensor, x_tensor)
+            u_pred_np = u_pred.cpu().numpy().flatten()
+        predictions.append(u_pred_np)
+
+        # 2. 计算Burgers方程物理残差
+        with torch.enable_grad():  # 临时启用梯度计算
+            u_pred_grad, du_dx, du_squared_dx, d2u_dx2, nu = model.compute_derivatives(
+                source_tensor, x_tensor
+            )
+
+        # 计算物理残差
+        initial_condition = test_sources[i, :-1]
+        Δt = test_sources[i, -1]
+        time_derivative = (u_pred_np - initial_condition) / (Δt + 1e-8)
+
+        du_squared_dx_np = du_squared_dx.detach().cpu().numpy().flatten()
+        d2u_dx2_np = d2u_dx2.detach().cpu().numpy().flatten()
+        nu_np = nu.detach().cpu().numpy()
+
+        # Burgers方程残差: ∂_t u + (1/2) * ∂_x (u²) - (ν/π) * ∂_{xx} u
+        burgers_residual = time_derivative + 0.5 * du_squared_dx_np - (nu_np / math.pi) * d2u_dx2_np
+        physics_residuals.append(burgers_residual)
+
+        # 计算误差
+        with torch.no_grad():
+            # 相对L2误差
+            l2_error = np.sqrt(np.mean((u_pred_np - test_solutions[i]) ** 2)) / (
+                    np.sqrt(np.mean(test_solutions[i] ** 2)) + 1e-8)
+            l2_errors.append(l2_error)
+
+            # 边界误差
+            boundary_error = np.abs(u_pred_np[0] - u_pred_np[-1])
+            boundary_errors.append(boundary_error)
+
+    # 统计结果
+    avg_l2_error = np.mean(l2_errors)
+    avg_relative_l2_error = np.mean(l2_errors)  # 已经是相对误差
+    avg_physics_residual = np.mean([np.mean(np.abs(res)) for res in physics_residuals])
+    avg_boundary_error = np.mean(boundary_errors)
+    std_l2_error = np.std(l2_errors)  # 新增：计算误差标准差
+
+    print(f"\n=== EVALUATION RESULTS ===")
+    print(f"  Average Relative L2 Error: {avg_relative_l2_error:.6f} (±{std_l2_error:.6f})")
+    print(f"  Average Absolute L2 Error: {avg_l2_error:.6f}")
+    print(f"  Average Burgers PDE Residual: {avg_physics_residual:.6f}")
+    print(f"  Average Boundary Error: {avg_boundary_error:.6f}")
+    print(f"  Learned Diffusion Coefficient ν: {nu_np:.6f}")
+    print(f"  ν/π: {nu_np / math.pi:.6f}")
+    print(f"  True ν: 0.001")
+    print(f"  Test Samples Evaluated: {len(l2_errors)}")
+
+    # ==================== 可视化测试结果 ====================
+    print("\n=== TEST RESULTS VISUALIZATION ===")
+    n_test_plots = min(6, len(predictions))
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+    for i in range(n_test_plots):
+        ax = axes[i // 3, i % 3]
+
+        # 提取数据
+        initial_condition = test_sources[i, :-1]
+        Δt = test_sources[i, -1]
+        target_solution = test_solutions[i]
+        prediction = predictions[i]
+
+        # 绘制结果
+        ax.plot(test_x, initial_condition, 'g-', linewidth=2, label='Initial u(x, t0)', alpha=0.7)
+        ax.plot(test_x, target_solution, 'b-', linewidth=2, label='True u(x, t1)', alpha=0.8)
+        ax.plot(test_x, prediction, 'r--', linewidth=2, label='Predicted u(x, t1)', alpha=0.8)
+
+        # 误差信息
+        l2_err = l2_errors[i]
+        phys_err = np.mean(np.abs(physics_residuals[i]))
+
+        ax.set_title(f'Test {i + 1}: Δt={Δt:.3f}\nRel L2={l2_err:.4f}, PDE Res={phys_err:.2e}', fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=9, loc='upper right')
+        ax.set_xlabel('x', fontsize=10)
+        ax.set_ylabel('u(x,t)', fontsize=10)
+        ax.set_xlim([test_x[0], test_x[-1]])
+        ax.tick_params(axis='both', which='major', labelsize=8)
+
+    plt.tight_layout()
+    plt.savefig('test_predictions_burgers.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # ==================== 误差分布 ====================
+    print("\n=== ERROR DISTRIBUTION ===")
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    # 相对L2误差分布
+    axes[0].hist(l2_errors, bins=20, alpha=0.7, edgecolor='black', density=True)
+    axes[0].axvline(np.mean(l2_errors), color='red', linestyle='--',
+                    label=f'Mean: {np.mean(l2_errors):.4f}', linewidth=2)
+    axes[0].set_title('Relative L2 Error Distribution', fontsize=12)
+    axes[0].set_xlabel('Relative L2 Error', fontsize=10)
+    axes[0].set_ylabel('Density', fontsize=10)
+    axes[0].legend(fontsize=9)
+    axes[0].grid(True, alpha=0.3)
+    axes[0].tick_params(axis='both', which='major', labelsize=8)
+
+    # Burgers方程物理残差分布
+    physics_residual_means = [np.mean(np.abs(res)) for res in physics_residuals]
+    axes[1].hist(physics_residual_means, bins=20, alpha=0.7, edgecolor='black', density=True)
+    axes[1].axvline(np.mean(physics_residual_means), color='red', linestyle='--',
+                    label=f'Mean: {np.mean(physics_residual_means):.4f}', linewidth=2)
+    axes[1].set_title('Burgers PDE Residual Distribution', fontsize=12)
+    axes[1].set_xlabel('Mean |PDE Residual|', fontsize=10)
+    axes[1].set_ylabel('Density', fontsize=10)
+    axes[1].legend(fontsize=9)
+    axes[1].grid(True, alpha=0.3)
+    axes[1].tick_params(axis='both', which='major', labelsize=8)
+
+    # 边界误差分布
+    axes[2].hist(boundary_errors, bins=20, alpha=0.7, edgecolor='black', density=True)
+    axes[2].axvline(np.mean(boundary_errors), color='red', linestyle='--',
+                    label=f'Mean: {np.mean(boundary_errors):.4f}', linewidth=2)
+    axes[2].set_title('Boundary Error Distribution', fontsize=12)
+    axes[2].set_xlabel('|u(0)-u(L)|', fontsize=10)
+    axes[2].set_ylabel('Density', fontsize=10)
+    axes[2].legend(fontsize=9)
+    axes[2].grid(True, alpha=0.3)
+    axes[2].tick_params(axis='both', which='major', labelsize=8)
+
+    plt.tight_layout()
+    plt.savefig('error_distributions_burgers.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # ==================== 物理残差空间分布 ====================
+    print("\n=== BURGERS PDE RESIDUAL SPATIAL DISTRIBUTION ===")
+    n_residual_plots = min(3, len(physics_residuals))
+    fig, axes = plt.subplots(n_residual_plots, 1, figsize=(12, 3 * n_residual_plots))
+
+    if n_residual_plots == 1:
+        axes = [axes]
+
+    for i in range(n_residual_plots):
+        ax = axes[i]
+        ax.plot(test_x, physics_residuals[i], 'purple', linewidth=1.5, alpha=0.8)
+        ax.axhline(y=0, color='k', linestyle='-', linewidth=0.5, alpha=0.5)
+        ax.fill_between(test_x, physics_residuals[i], 0, where=(physics_residuals[i] >= 0),
+                        color='red', alpha=0.3, interpolate=True, label='Positive residual')
+        ax.fill_between(test_x, physics_residuals[i], 0, where=(physics_residuals[i] <= 0),
+                        color='blue', alpha=0.3, interpolate=True, label='Negative residual')
+
+        mean_res = np.mean(np.abs(physics_residuals[i]))
+        max_res = np.max(np.abs(physics_residuals[i]))
+        ax.set_title(f'Burgers PDE Residual Sample {i + 1}\nMean |Res| = {mean_res:.2e}, Max |Res| = {max_res:.2e}',
+                     fontsize=10)
+        ax.set_xlabel('x', fontsize=10)
+        ax.set_ylabel('PDE Residual', fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', which='major', labelsize=8)
+        ax.set_xlim([test_x[0], test_x[-1]])
+        if i == 0:
+            ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig('burgers_pde_residuals.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # ==================== 总结 ====================
+    print("\n" + "=" * 60)
+    print("BURGERS EQUATION TRAINING COMPLETE - SUMMARY")
+    print("=" * 60)
+    print(f"Burgers Equation: ∂_t u + ∂_x (u²/2) = ν/π ∂_{{xx}} u")
+    print(f"Domain: x ∈ ({x[0]:.2f}, {x[-1]:.2f}), t ∈ ({t_coord_for_tensor[0]:.2f}, {t_coord_for_tensor[-1]:.2f}]")
+
+    print(f"\nModel Architecture:")
+    print(f"  - Branch input dim: {branch_input_dim} (u0: {branch_input_dim - 1} + Δt: 1)")
+    print(f"  - Trunk input dim: {trunk_input_dim} (x)")
+    print(f"  - Hidden dim: {model.hidden_dim}")
+    print(f"  - Basis functions: {model.num_basis}")
+    print(f"  - Total parameters: {total_params:,}")
+
+    print(f"\nTraining Results:")
+    print(f"  - Final train loss: {train_losses['total'][-1]:.2e}")
+    print(f"  - Final val loss: {val_losses['total'][-1]:.2e}")
+    print(f"  - Learned viscosity ν: {learned_nu:.6f}")
+    print(f"  - Learned ν/π: {learned_nu / math.pi:.6f}")
+    print(f"  - True ν: 0.001")
+    print(f"  - Difference: {abs(learned_nu - 0.001):.6f}")
+
+    print(f"\nTest Performance:")
+    print(f"  - Avg Relative L2 Error: {avg_relative_l2_error:.6f} (±{std_l2_error:.6f})")
+    print(f"  - Avg Burgers PDE Residual: {avg_physics_residual:.6f}")
+    print(f"  - Avg Boundary Error: {avg_boundary_error:.6f}")
+    print(f"  - Samples evaluated: {len(l2_errors)}")
+
+    print(f"\nData Statistics:")
+    print(f"  - Total samples: {len(source_functions)}")
+    print(f"  - Train/Val/Test split: 70%/15%/15%")
+    print(f"  - Spatial resolution: {len(x)} points")
+    print(f"  - Spatial domain size Lx: {x[-1] - x[0]:.2f}")
+    print(
+        f"  - Time step range: {np.min([s[-1] for s in source_functions]):.4f} - {np.max([s[-1] for s in source_functions]):.4f}")
+    print(f"  - Avg time step: {np.mean([s[-1] for s in source_functions]):.4f}")
+
+    print(f"\nReynolds Number Analysis:")
+    L = x[-1] - x[0]  # 特征长度
+    u_mean = np.mean(np.abs(solutions))  # 特征速度
+    nu_true = 0.001
+    Re = u_mean * L / nu_true
+    print(f"  - Characteristic length L: {L:.2f}")
+    print(f"  - Characteristic velocity u_mean: {u_mean:.4f}")
+    print(f"  - Viscosity ν: {nu_true:.6f}")
+    print(f"  - Reynolds number Re = uL/ν: {Re:.2f}")
+    if Re > 1:
+        print(f"  - Flow regime: Strong nonlinear (Re > 1, shock formation possible)")
+    else:
+        print(f"  - Flow regime: Diffusive (Re < 1)")
+
+    print("\n" + "=" * 60)
+    print("All plots have been saved as PNG files:")
+    print("  - burgers_sample_data.png")
+    print("  - training_history_burgers.png")
+    print("  - test_predictions_burgers.png")
+    print("  - error_distributions_burgers.png")
+    print("  - burgers_pde_residuals.png")
+    print("Training log saved to: ./models/training_log.json")
+    print("Best model saved to: ./models/best_burgers_model.pth")
+    print("=" * 60)
