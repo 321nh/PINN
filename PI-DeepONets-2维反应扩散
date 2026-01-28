@@ -9,9 +9,9 @@ from torch.utils.data import DataLoader, TensorDataset
 import os
 import json
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
-
 
 plt.rcParams['mathtext.fontset'] = 'dejavusans'
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']  # 支持中文+上标+特殊符号
@@ -35,6 +35,9 @@ os.makedirs('models', exist_ok=True)
 TRUE_DU = 1e-3  # 激活剂扩散系数
 TRUE_DV = 5e-3  # 抑制剂扩散系数
 TRUE_K = 5e-3  # 反应项常数k
+
+AUGMENT_NOISE_LEVEL = 0.01  # 增强噪声强度
+AUGMENT_TIMES = 2  # 每个样本增强次数
 
 
 # ==================== 2. 数据加载与预处理 ====================
@@ -88,6 +91,18 @@ def load_2d_diffusion_data(h5_path, max_groups=100, use_first_n_groups=50):
     print(f"  v值范围: {v_data.min():.4f} ~ {v_data.max():.4f}")
 
     return u_data, v_data, t_data, x_data, y_data
+
+
+# 【新增】数据增强函数
+def augment_data(u0, v0, noise_level=0.01):
+    """对初始条件做微小扰动增强数据"""
+    # 加微小高斯噪声
+    u0_aug = u0 + np.random.normal(0, noise_level, u0.shape)
+    v0_aug = v0 + np.random.normal(0, noise_level, v0.shape)
+    # 约束值在合理范围（避免物理意义失效）
+    u0_aug = np.clip(u0_aug, 0, 1)
+    v0_aug = np.clip(v0_aug, 0, 1)
+    return u0_aug, v0_aug
 
 
 def prepare_training_data(u_data, v_data, t_data, x_data, y_data,
@@ -145,11 +160,20 @@ def prepare_training_data(u_data, v_data, t_data, x_data, y_data,
             sample_y = y_flat[spatial_indices]
             trunk_sample = np.stack([sample_t, sample_x, sample_y], axis=-1)
 
-            # 收集数据
+            # 收集原始数据
             uv0_list.append(uv0)
             trunk_list.append(trunk_sample)
             u_true_list.append(u1[spatial_indices])
             v_true_list.append(v1[spatial_indices])
+
+            # 数据增强
+            for _ in range(AUGMENT_TIMES):
+                u0_aug, v0_aug = augment_data(u0, v0, AUGMENT_NOISE_LEVEL)
+                uv0_aug = np.concatenate([u0_aug, v0_aug], axis=0)
+                uv0_list.append(uv0_aug)
+                trunk_list.append(trunk_sample)  # 时空坐标不变
+                u_true_list.append(u1[spatial_indices])
+                v_true_list.append(v1[spatial_indices])
 
             pbar.update(1)
     pbar.close()
@@ -160,8 +184,19 @@ def prepare_training_data(u_data, v_data, t_data, x_data, y_data,
     u_true_array = np.array(u_true_list, dtype=np.float32)
     v_true_array = np.array(v_true_list, dtype=np.float32)
 
+    # 高维输入归一化（关键：解决32768维输入梯度不稳定问题）
+    print("对初始条件uv0进行归一化...")
+    scaler = StandardScaler()
+    # 展平最后一维做归一化，再恢复形状
+    uv0_shape = uv0_array.shape
+    uv0_array = scaler.fit_transform(uv0_array.reshape(-1, uv0_shape[-1])).reshape(uv0_shape)
+
+    # 保存scaler（可选，用于后续推理）
+    np.save('models/uv0_scaler_mean.npy', scaler.mean_)
+    np.save('models/uv0_scaler_scale.npy', scaler.scale_)
+
     print(f"数据预处理完成:")
-    print(f"  初始条件形状: {uv0_array.shape} (u + v)")
+    print(f"  初始条件形状: {uv0_array.shape} (u + v) (含增强数据)")
     print(f"  时空坐标形状: {trunk_array.shape}")
     print(f"  u真实值形状: {u_true_array.shape}")
     print(f"  v真实值形状: {v_true_array.shape}")
@@ -181,7 +216,7 @@ def visualize_dataset_samples(u_data, v_data, t_data, x_data, y_data, save_path=
     time_indices = [0, 25, 50, 100]  # 选择4个时间步
 
     # 创建子图 (3组 × 4时间步 × 2变量)
-    fig, axes = plt.subplots(3, 8, figsize=(32, 15),constrained_layout=True)
+    fig, axes = plt.subplots(3, 8, figsize=(32, 15), constrained_layout=True)
 
     # 动态调整颜色范围
     u_vals = []
@@ -292,26 +327,56 @@ class FitzHughNagumoDeepONet(nn.Module):
     同时预测u和v，严格匹配论文中的方程
     """
 
-    def __init__(self, branch_input_dim, trunk_input_dim, hidden_dim=64, num_basis=32):
+    def __init__(self, branch_input_dim, trunk_input_dim, hidden_dim=128, num_basis=64):
         super().__init__()
         self.num_basis = num_basis
         self.hidden_dim = hidden_dim
+        self.branch_input_dim = branch_input_dim
+        self.spatial_dim = branch_input_dim // 2  # u0/v0各占一半
 
-        # Branch网络：处理u和v的初始条件
-        self.branch_net = nn.Sequential(
-            nn.Linear(branch_input_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 2 * num_basis)  # ×2因为要同时预测u和v
+        # Branch网络：卷积降维 + MLP（处理高维输入）
+        self.branch_conv = nn.Sequential(
+            # 输入：(batch, 2, spatial_dim) → 2通道（u0, v0）
+            nn.Conv1d(in_channels=2, out_channels=64, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.MaxPool1d(kernel_size=2),
         )
 
-        # Trunk网络：处理时空坐标
+        # 【核心修复】动态计算卷积输出维度（替代手动硬编码）
+        # 用一个虚拟输入跑一遍卷积，获取真实输出维度
+        with torch.no_grad():
+            # 构造和实际输入同形状的虚拟张量：(1, 2, spatial_dim)
+            dummy_input = torch.randn(1, 2, self.spatial_dim)
+            dummy_conv_out = self.branch_conv(dummy_input)
+            self.conv_out_dim = dummy_conv_out.numel()  # 卷积输出的总特征数（展平后）
+        # 打印维度信息，方便调试
+        print(f"卷积输出维度校验：")
+        print(f"  虚拟输入形状: {dummy_input.shape}")
+        print(f"  卷积输出形状: {dummy_conv_out.shape}")
+        print(f"  展平后维度: {self.conv_out_dim}")
+
+        # Branch MLP（输入维度改为动态计算的self.conv_out_dim）
+        self.branch_mlp = nn.Sequential(
+            nn.Linear(self.conv_out_dim, hidden_dim),  # 【修复】使用动态计算的维度
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 2 * num_basis)
+        )
+
+        # Trunk网络（保持不变）
         self.trunk_net = nn.Sequential(
             nn.Linear(trunk_input_dim, hidden_dim),
-            nn.Tanh(),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
             nn.Linear(hidden_dim, 2 * num_basis)
         )
 
@@ -320,9 +385,9 @@ class FitzHughNagumoDeepONet(nn.Module):
         self.bias_v = nn.Parameter(torch.zeros(1))
 
         # 物理参数（使用Softplus确保非负）
-        self.Du_raw = nn.Parameter(torch.tensor(TRUE_DU))  # 激活剂扩散系数
-        self.Dv_raw = nn.Parameter(torch.tensor(TRUE_DV))  # 抑制剂扩散系数
-        self.k_raw = nn.Parameter(torch.tensor(TRUE_K))  # 反应项常数k
+        self.Du_raw = nn.Parameter(torch.tensor(TRUE_DU))
+        self.Dv_raw = nn.Parameter(torch.tensor(TRUE_DV))
+        self.k_raw = nn.Parameter(torch.tensor(TRUE_K))
 
     @property
     def Du(self):
@@ -346,8 +411,20 @@ class FitzHughNagumoDeepONet(nn.Module):
         trunk_input: [batch_size, num_points, trunk_input_dim]
         return: u_pred [batch_size, num_points], v_pred [batch_size, num_points]
         """
-        # Branch网络输出
-        branch_out = self.branch_net(branch_input)  # [batch, 2*num_basis]
+        batch_size = branch_input.shape[0]
+        # 重塑为卷积输入格式：(batch, 2, spatial_dim)
+        branch_input_reshaped = branch_input.reshape(batch_size, 2, self.spatial_dim)
+
+        # 【新增】维度校验，方便调试
+        if branch_input_reshaped.shape[2] != self.spatial_dim:
+            raise ValueError(f"输入空间维度不匹配！预期{self.spatial_dim}，实际{branch_input_reshaped.shape[2]}")
+
+        branch_conv_out = self.branch_conv(branch_input_reshaped)
+        branch_conv_flat = torch.flatten(branch_conv_out, start_dim=1)
+
+        # 现在维度匹配，不会再报矩阵乘法错误
+        branch_out = self.branch_mlp(branch_conv_flat)  # [batch, 2*num_basis]
+
         branch_out_u = branch_out[:, :self.num_basis]  # u的基函数
         branch_out_v = branch_out[:, self.num_basis:]  # v的基函数
 
@@ -369,31 +446,28 @@ class FitzHughNagumoDeepONet(nn.Module):
     def compute_derivatives(self, branch_input, trunk_input):
         """
         计算u和v的各阶导数（用于物理损失）
+        【修改】修复梯度计算逻辑，增加异常处理
         返回: u_pred, v_pred, 以及各阶导数
         """
         # 深拷贝并开启梯度
-        trunk_input_grad = torch.clone(trunk_input).detach().requires_grad_(True)
+        trunk_input_grad = torch.clone(trunk_input).detach().requires_grad_(True).to(device)
 
         # 前向传播
         u_pred, v_pred = self.forward(branch_input, trunk_input_grad)
         batch_size, num_points = u_pred.shape
 
-        # 初始化导数
-        def init_deriv():
-            return torch.zeros(batch_size, num_points, 1, device=device, requires_grad=True)
+        # 初始化导数（【修改】简化初始化，避免梯度混乱）
+        du_dt = torch.zeros(batch_size, num_points, device=device)
+        du_dx = torch.zeros(batch_size, num_points, device=device)
+        du_dy = torch.zeros(batch_size, num_points, device=device)
+        d2u_dx2 = torch.zeros(batch_size, num_points, device=device)
+        d2u_dy2 = torch.zeros(batch_size, num_points, device=device)
 
-
-        du_dt = torch.zeros_like(u_pred).unsqueeze(-1).requires_grad_(True)
-        du_dx = torch.zeros_like(u_pred).unsqueeze(-1).requires_grad_(True)
-        du_dy = torch.zeros_like(u_pred).unsqueeze(-1).requires_grad_(True)
-        d2u_dx2 = torch.zeros_like(u_pred).unsqueeze(-1).requires_grad_(True)
-        d2u_dy2 = torch.zeros_like(u_pred).unsqueeze(-1).requires_grad_(True)
-
-        dv_dt = torch.zeros_like(v_pred).unsqueeze(-1).requires_grad_(True)
-        dv_dx = torch.zeros_like(v_pred).unsqueeze(-1).requires_grad_(True)
-        dv_dy = torch.zeros_like(v_pred).unsqueeze(-1).requires_grad_(True)
-        d2v_dx2 = torch.zeros_like(v_pred).unsqueeze(-1).requires_grad_(True)
-        d2v_dy2 = torch.zeros_like(v_pred).unsqueeze(-1).requires_grad_(True)
+        dv_dt = torch.zeros(batch_size, num_points, device=device)
+        dv_dx = torch.zeros(batch_size, num_points, device=device)
+        dv_dy = torch.zeros(batch_size, num_points, device=device)
+        d2v_dx2 = torch.zeros(batch_size, num_points, device=device)
+        d2v_dy2 = torch.zeros(batch_size, num_points, device=device)
 
         try:
             # 计算u的一阶梯度
@@ -406,26 +480,31 @@ class FitzHughNagumoDeepONet(nn.Module):
             )[0]
 
             if grad_u is not None:
-                du_dt = grad_u[..., 0:1]
-                du_dx = grad_u[..., 1:2]
-                du_dy = grad_u[..., 2:3]
+                du_dt = grad_u[..., 0]
+                du_dx = grad_u[..., 1]
+                du_dy = grad_u[..., 2]
 
-                # u的二阶梯度
-                d2u_dx2 = torch.autograd.grad(
+                # u的二阶梯度（x方向）
+                grad_du_dx = torch.autograd.grad(
                     outputs=du_dx.sum(),
                     inputs=trunk_input_grad,
                     create_graph=True,
                     retain_graph=True,
                     allow_unused=True
-                )[0][..., 1:2] if grad_u is not None else init_deriv()
+                )[0]
+                if grad_du_dx is not None:
+                    d2u_dx2 = grad_du_dx[..., 1]
 
-                d2u_dy2 = torch.autograd.grad(
+                # u的二阶梯度（y方向）
+                grad_du_dy = torch.autograd.grad(
                     outputs=du_dy.sum(),
                     inputs=trunk_input_grad,
                     create_graph=True,
                     retain_graph=True,
                     allow_unused=True
-                )[0][..., 2:3] if grad_u is not None else init_deriv()
+                )[0]
+                if grad_du_dy is not None:
+                    d2u_dy2 = grad_du_dy[..., 2]
 
             # 计算v的一阶梯度
             grad_v = torch.autograd.grad(
@@ -437,46 +516,54 @@ class FitzHughNagumoDeepONet(nn.Module):
             )[0]
 
             if grad_v is not None:
-                dv_dt = grad_v[..., 0:1]
-                dv_dx = grad_v[..., 1:2]
-                dv_dy = grad_v[..., 2:3]
+                dv_dt = grad_v[..., 0]
+                dv_dx = grad_v[..., 1]
+                dv_dy = grad_v[..., 2]
 
-                # v的二阶梯度
-                d2v_dx2 = torch.autograd.grad(
+                # v的二阶梯度（x方向）
+                grad_dv_dx = torch.autograd.grad(
                     outputs=dv_dx.sum(),
                     inputs=trunk_input_grad,
                     create_graph=True,
                     retain_graph=True,
                     allow_unused=True
-                )[0][..., 1:2] if grad_v is not None else init_deriv()
+                )[0]
+                if grad_dv_dx is not None:
+                    d2v_dx2 = grad_dv_dx[..., 1]
 
-                d2v_dy2 = torch.autograd.grad(
+                # v的二阶梯度（y方向）
+                grad_dv_dy = torch.autograd.grad(
                     outputs=dv_dy.sum(),
                     inputs=trunk_input_grad,
                     create_graph=True,
                     retain_graph=True,
                     allow_unused=True
-                )[0][..., 2:3] if grad_v is not None else init_deriv()
+                )[0]
+                if grad_dv_dy is not None:
+                    d2v_dy2 = grad_dv_dy[..., 2]
 
         except Exception as e:
             # 只打印严重错误，忽略梯度警告
             if "RuntimeError" in str(e):
-                print(f"梯度计算错误: {e}")
+                print(f"梯度计算警告: {e}")
 
-
+        # 增加维度匹配
         return (u_pred, v_pred,
-                du_dt, du_dx, du_dy, d2u_dx2, d2u_dy2,
-                dv_dt, dv_dx, dv_dy, d2v_dx2, d2v_dy2)
+                du_dt.unsqueeze(-1), du_dx.unsqueeze(-1), du_dy.unsqueeze(-1),
+                d2u_dx2.unsqueeze(-1), d2u_dy2.unsqueeze(-1),
+                dv_dt.unsqueeze(-1), dv_dx.unsqueeze(-1), dv_dy.unsqueeze(-1),
+                d2v_dx2.unsqueeze(-1), d2v_dy2.unsqueeze(-1))
 
 
 # ==================== 5. 损失函数 ====================
 def fitzhugh_nagumo_loss(model, uv0_input, trunk_input, u_true, v_true,
-                         lambda_physics=1.0, lambda_boundary=5.0, lambda_params=2.0):
+                         lambda_physics=0.1, lambda_boundary=1.0, lambda_params=1.0):  # 【修改】平衡损失权重
     """
     FitzHugh-Nagumo方程的混合损失函数
     严格按照论文公式：
     ∂t u = Du(∂xx u + ∂yy u) + u - u³ - k - v
     ∂t v = Dv(∂xx v + ∂yy v) + u - v
+    【修改】降低物理损失权重，避免模型过度拟合物理约束
     """
     # 计算预测值和导数
     (u_pred, v_pred,
@@ -537,7 +624,7 @@ def fitzhugh_nagumo_loss(model, uv0_input, trunk_input, u_true, v_true,
 
 # ==================== 6. 数据加载器 ====================
 def create_data_loaders(uv0_array, trunk_array, u_true_array, v_true_array,
-                        batch_size=32, val_split=0.15, test_split=0.15):
+                        batch_size=16, val_split=0.15, test_split=0.15):  # 【修改】减小批次大小
     """
     创建训练/验证/测试数据加载器（包含u和v）
     """
@@ -592,9 +679,10 @@ def create_data_loaders(uv0_array, trunk_array, u_true_array, v_true_array,
 
 
 # ==================== 7. 模型训练 ====================
-def train_model(model, train_loader, val_loader, num_epochs=1000, lr=0.0005, weight_decay=1e-5):
+def train_model(model, train_loader, val_loader, num_epochs=10, lr=0.001, weight_decay=1e-5):  # 【修改】提高初始学习率
     """
     训练模型 - 适配FitzHugh-Nagumo方程
+    【修改】优化学习率调度，增加早停
     """
     print("\n=== 开始训练模型 ===")
     print(f"训练轮数: {num_epochs}")
@@ -604,15 +692,13 @@ def train_model(model, train_loader, val_loader, num_epochs=1000, lr=0.0005, wei
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # 学习率调度器：预热 + 余弦退火
-    def lr_lambda(epoch):
-        warmup_epochs = 20
-        if epoch < warmup_epochs:
-            return epoch / warmup_epochs
-        else:
-            return 0.5 * (1 + np.cos(np.pi * (epoch - warmup_epochs) / (num_epochs - warmup_epochs)))
+    # 【修改】学习率调度器：余弦退火（避免学习率降到0）
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    # 【新增】早停配置
+    early_stop_patience = 80
+    early_stop_counter = 0
+
     # 记录训练日志
     train_log = {
         'total_loss': [], 'data_loss': [], 'physics_loss': [], 'boundary_loss': [], 'params_loss': [],
@@ -643,7 +729,8 @@ def train_model(model, train_loader, val_loader, num_epochs=1000, lr=0.0005, wei
         train_steps = 0
 
         for batch in train_loader:
-            uv0_batch, trunk_batch, u_true_batch, v_true_batch = [x.to(device) for x in batch]
+            uv0_batch, trunk_batch, u_true_batch, v_true_batch = [x.to(device, non_blocking=True) for x in
+                                                                  batch]  # 【新增】non_blocking加速
 
             optimizer.zero_grad()
 
@@ -654,7 +741,7 @@ def train_model(model, train_loader, val_loader, num_epochs=1000, lr=0.0005, wei
 
             # 反向传播
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)  # 梯度裁剪
             optimizer.step()
 
             # 累加损失
@@ -692,7 +779,7 @@ def train_model(model, train_loader, val_loader, num_epochs=1000, lr=0.0005, wei
 
         with torch.no_grad():
             for batch in val_loader:
-                uv0_batch, trunk_batch, u_true_batch, v_true_batch = [x.to(device) for x in batch]
+                uv0_batch, trunk_batch, u_true_batch, v_true_batch = [x.to(device, non_blocking=True) for x in batch]
                 losses = fitzhugh_nagumo_loss(model, uv0_batch, trunk_batch, u_true_batch, v_true_batch)
 
                 val_losses['total'] += losses[0].item()
@@ -730,6 +817,7 @@ def train_model(model, train_loader, val_loader, num_epochs=1000, lr=0.0005, wei
         if val_losses['total'] < best_val_loss:
             best_val_loss = val_losses['total']
             best_epoch = epoch
+            early_stop_counter = 0  # 重置早停计数器
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -739,6 +827,12 @@ def train_model(model, train_loader, val_loader, num_epochs=1000, lr=0.0005, wei
                 'val_log': val_log,
                 'param_log': param_log
             }, 'models/best_model.pth')
+        else:
+            early_stop_counter += 1
+            # 【新增】早停逻辑
+            if early_stop_counter >= early_stop_patience:
+                print(f"\n早停触发！验证损失连续{early_stop_patience}轮未下降，最佳epoch: {best_epoch}")
+                break
 
         # 更新进度条
         pbar.set_postfix({
@@ -896,6 +990,7 @@ def visualize_training_results(log_data, save_dir='saved_figures'):
 
     print(f"训练损失曲线已保存至: {save_dir}/training_loss_curves.png")
 
+
 # ==================== 9. 模型评估与预测可视化 ====================
 def evaluate_model(model, test_loader, save_dir='saved_figures'):
     """
@@ -923,10 +1018,10 @@ def evaluate_model(model, test_loader, save_dir='saved_figures'):
             physics_losses.append(losses[2].item())  # physics_loss
 
             # 正确分离梯度并转换为numpy
-            all_u_preds.extend(u_pred.detach().cpu().numpy().flatten())
-            all_u_trues.extend(u_true_batch.detach().cpu().numpy().flatten())
-            all_v_preds.extend(v_pred.detach().cpu().numpy().flatten())
-            all_v_trues.extend(v_true_batch.detach().cpu().numpy().flatten())
+            all_u_preds.extend(u_pred.cpu().numpy().flatten())
+            all_u_trues.extend(u_true_batch.cpu().numpy().flatten())
+            all_v_preds.extend(v_pred.cpu().numpy().flatten())
+            all_v_trues.extend(v_true_batch.cpu().numpy().flatten())
 
     # 转换为numpy数组
     all_u_preds = np.array(all_u_preds)
@@ -984,7 +1079,7 @@ def evaluate_model(model, test_loader, save_dir='saved_figures'):
     sample_idx = 0
     # 关键修复：使用detach()分离梯度
     plt.plot(u_true_batch[sample_idx].cpu().numpy(), label='真实值', linewidth=1.5, color='green')
-    plt.plot(u_pred[sample_idx].detach().cpu().numpy(), label='预测值', linewidth=1.5, linestyle='--', color='green')
+    plt.plot(u_pred[sample_idx].cpu().numpy(), label='预测值', linewidth=1.5, linestyle='--', color='green')
     plt.xlabel('空间点索引')
     plt.ylabel('u值')
     plt.title('单个样本u预测对比')
@@ -994,7 +1089,7 @@ def evaluate_model(model, test_loader, save_dir='saved_figures'):
     # 子图4：单个样本v的预测对比
     plt.subplot(1, 4, 4)
     plt.plot(v_true_batch[sample_idx].cpu().numpy(), label='真实值', linewidth=1.5, color='orange')
-    plt.plot(v_pred[sample_idx].detach().cpu().numpy(), label='预测值', linewidth=1.5, linestyle='--', color='orange')
+    plt.plot(v_pred[sample_idx].cpu().numpy(), label='预测值', linewidth=1.5, linestyle='--', color='orange')
     plt.xlabel('空间点索引')
     plt.ylabel('v值')
     plt.title('单个样本v预测对比')
@@ -1020,14 +1115,6 @@ def evaluate_model(model, test_loader, save_dir='saved_figures'):
 
     return eval_metrics
 
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-from tqdm import tqdm
-
-# 先定义device（确保全局可用，或在函数内定义）
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ==================== 10. 预测vs真实动态对比动画 ====================
 def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_data,
@@ -1046,8 +1133,7 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
     :param time_steps: 选择哪些时间步（None则用全部）
     """
     print("\n=== 生成预测vs真实动态对比动画 ===")
-    model.eval()  # 模型设为评估模式
-    model = model.to(device)  # 确保模型在指定设备上（关键：和输入张量对齐）
+    model.eval()
 
     # 选择时间步
     if time_steps is None:
@@ -1069,14 +1155,19 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
     pred_u_all = []
     pred_v_all = []
 
+    # 加载归一化scaler
+    scaler_mean = np.load('models/uv0_scaler_mean.npy')
+    scaler_scale = np.load('models/uv0_scaler_scale.npy')
+
     # 以t=0为初始条件，逐时间步预测
-    with torch.no_grad():  # 禁用梯度计算，节省内存+加快速度
+    with torch.no_grad():
         # 初始条件（t=0）
         u0 = group_u_data[0].flatten()
         v0 = group_v_data[0].flatten()
         uv0 = np.concatenate([u0, v0], axis=0).astype(np.float32)
-        # 【修改1：显式指定dtype=torch.float32，确保类型匹配】
-        uv0_tensor = torch.tensor(uv0, dtype=torch.float32).unsqueeze(0).to(device)
+        # 【新增】归一化初始条件
+        uv0 = (uv0 - scaler_mean) / scaler_scale
+        uv0_tensor = torch.tensor(uv0).unsqueeze(0).to(device)
 
         # 对每个目标时间步进行预测
         for t_idx in tqdm(time_steps, desc="生成预测结果"):
@@ -1087,10 +1178,9 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
             dt_array = np.full(total_spatial_points, dt, dtype=np.float32)
             trunk_input = np.stack([dt_array, x_flat, y_flat], axis=-1)
             trunk_input = trunk_input.reshape(1, total_spatial_points, 3)
-            # 【修改2：显式指定dtype=torch.float32，确保类型匹配】
-            trunk_tensor = torch.tensor(trunk_input, dtype=torch.float32).to(device)
+            trunk_tensor = torch.tensor(trunk_input).to(device)
 
-            # 模型预测（此时输入和模型参数都是float32，设备也一致）
+            # 模型预测
             u_pred, v_pred = model(uv0_tensor, trunk_tensor)
 
             # 重塑为2D
@@ -1101,8 +1191,8 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
             pred_v_all.append(v_pred_2d)
 
     # 确定颜色范围（使用真实值的5%-95%分位数，保证对比公平）
-    u_vals = group_u_data[list(time_steps)].flatten()  # 【小优化：time_steps转list避免索引警告】
-    v_vals = group_v_data[list(time_steps)].flatten()
+    u_vals = group_u_data[time_steps].flatten()
+    v_vals = group_v_data[time_steps].flatten()
     u_vmin, u_vmax = np.percentile(u_vals, [5, 95])
     v_vmin, v_vmax = np.percentile(v_vals, [5, 95])
 
@@ -1111,19 +1201,15 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
     ax1, ax2 = axes[0]  # 第一行：真实u | 预测u
     ax3, ax4 = axes[1]  # 第二行：真实v | 预测v
 
-    # 初始化图像（注意：imshow默认是(y,x)，需要调整origin='lower'保证坐标对齐）
+    # 初始化图像
     im1 = ax1.imshow(group_u_data[time_steps[0]], cmap='RdBu_r', vmin=u_vmin, vmax=u_vmax,
-                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
-                     origin='lower')  # 【小优化：添加origin='lower'，坐标更直观】
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()])
     im2 = ax2.imshow(pred_u_all[0], cmap='RdBu_r', vmin=u_vmin, vmax=u_vmax,
-                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
-                     origin='lower')
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()])
     im3 = ax3.imshow(group_v_data[time_steps[0]], cmap='RdYlBu_r', vmin=v_vmin, vmax=v_vmax,
-                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
-                     origin='lower')
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()])
     im4 = ax4.imshow(pred_v_all[0], cmap='RdYlBu_r', vmin=v_vmin, vmax=v_vmax,
-                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()],
-                     origin='lower')
+                     extent=[x_data.min(), x_data.max(), y_data.min(), y_data.max()])
 
     # 设置标题和标签
     title1 = ax1.set_title(f'Group {group_idx}, t={t_data[time_steps[0]]:.2f}\nTrue u (activator)')
@@ -1134,9 +1220,8 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
     for ax in [ax1, ax2, ax3, ax4]:
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
-        ax.set_aspect('equal')  # 【小优化：保持XY轴比例一致】
 
-    # 添加颜色条（统一颜色条宽度，更美观）
+    # 添加颜色条
     cbar1 = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
     cbar1.set_label('u value')
     cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
@@ -1145,9 +1230,6 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
     cbar3.set_label('v value')
     cbar4 = fig.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
     cbar4.set_label('v value')
-
-    # 调整子图间距，避免重叠
-    plt.tight_layout()
 
     # 更新函数
     def update(frame):
@@ -1166,16 +1248,17 @@ def create_prediction_comparison_gif(model, u_data, v_data, t_data, x_data, y_da
 
         return im1, im2, im3, im4, title1, title2, title3, title4
 
-    # 生成动画（添加repeat=True，动画循环播放）
+    # 生成动画
     ani = animation.FuncAnimation(
         fig, update, frames=len(time_steps),
-        interval=300, blit=True, repeat=True
+        interval=300, blit=True
     )
 
-    # 保存动画（添加writer参数的fps，确保播放速度稳定）
-    ani.save(save_path, writer='pillow', dpi=150, fps=5)
-    plt.close(fig)  # 关闭画布，释放内存
+    # 保存动画
+    ani.save(save_path, writer='pillow', dpi=150)
+    plt.close()
     print(f"预测vs真实动态对比动画已保存至: {save_path}")
+
 
 # ==================== 11. 主程序 ====================
 if __name__ == "__main__":
@@ -1186,11 +1269,11 @@ if __name__ == "__main__":
     NUM_SAMPLES_PER_GROUP = 20
     NUM_POINTS_PER_SAMPLE = 200
     MAX_TIME_INTERVAL = 10
-    BATCH_SIZE = 32
-    HIDDEN_DIM = 64
-    NUM_BASIS = 32
-    NUM_EPOCHS = 1000
-    LR = 0.0005
+    BATCH_SIZE = 16
+    HIDDEN_DIM = 128
+    NUM_BASIS = 64
+    NUM_EPOCHS = 10
+    LR = 0.001
 
     # 1. 加载数据（包含u和v）
     u_data, v_data, t_data, x_data, y_data = load_2d_diffusion_data(
@@ -1202,7 +1285,7 @@ if __name__ == "__main__":
     # 2. 可视化数据集样本
     visualize_dataset_samples(u_data, v_data, t_data, x_data, y_data)
 
-    #生成演化动画（可选）
+    # 生成演化动画（可选）
     create_evolution_gif(u_data, v_data, t_data, x_data, y_data)
 
     # 3. 预处理训练数据
